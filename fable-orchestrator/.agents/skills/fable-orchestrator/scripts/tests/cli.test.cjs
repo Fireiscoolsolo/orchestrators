@@ -66,6 +66,16 @@ const next = (cwd) => JSON.parse(ok(cwd, ['next', '--json']));
 const stateOf = (run) => JSON.parse(fs.readFileSync(path.join(run.runDir, 'state.json'), 'utf8'));
 const events = (run) => fs.readFileSync(path.join(run.runDir, 'events.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
 
+function currentTask(repo, id) {
+  const runtime = path.join(repo, '.claude', 'fable-orchestrator');
+  const run = fs.readFileSync(path.join(runtime, 'current'), 'utf8').trim();
+  return stateOf({ runDir: path.join(runtime, 'runs', run) }).tasks[id];
+}
+
+function bind(repo, spec, dir, branch, agent = 'worker-' + spec.attempt_id) {
+  return ok(repo, ['bind-worktree', spec.task_id, '--attempt-id', spec.attempt_id, '--worktree', dir, '--branch', branch, '--agent-id', agent]);
+}
+
 /** Play the worker for one dispatch spec in its own git worktree, as native isolation would. */
 function worker(repo, scratch, spec, mutate, reportExtra, opts) {
   const refs = [...spec.prompt.matchAll(/git merge --no-edit ([0-9a-f]{40})/g)].map((m) => m[1]);
@@ -77,8 +87,9 @@ function worker(repo, scratch, spec, mutate, reportExtra, opts) {
   const files = mutate(dir);
   git(dir, 'add', '-A');
   git(dir, 'commit', '-m', `${spec.task_id}: work`);
+  if (!opts?.unbound) bind(repo, spec, dir, branch);
   const report = Object.assign({
-    task_id: spec.task_id, status: 'implemented', summary: `Implemented ${spec.task_id}`, files_changed: files,
+    task_id: spec.task_id, attempt_id: spec.attempt_id, status: 'implemented', summary: `Implemented ${spec.task_id}`, files_changed: files,
     verification: { tests_run: true, tests_passed: true, build_passed: null }, known_issues: [],
     commit: git(dir, 'rev-parse', 'HEAD'), branch, worktree_path: dir,
   }, reportExtra || {});
@@ -86,11 +97,11 @@ function worker(repo, scratch, spec, mutate, reportExtra, opts) {
   fs.writeFileSync(file, `Work finished.\n\n\`\`\`yaml\n${yaml.dump(report)}\`\`\`\n`);
   return file;
 }
-function reviewFile(scratch, id, n, verdict) {
+function reviewFile(repo, scratch, id, n, verdict) {
   const approve = verdict !== 'reject';
   const file = path.join(scratch, `${id}.review.${Date.now()}.yaml`);
   fs.writeFileSync(file, yaml.dump({
-    task_id: id, reviewer: 'orchestrator', verdict: approve ? 'approve' : 'reject',
+    task_id: id, reviewer: 'orchestrator', candidate_commit: currentTask(repo, id).verified_candidate?.commit, verdict: approve ? 'approve' : 'reject',
     criteria: Array.from({ length: n }, () => ({ met: approve, evidence: 'check output and diff inspected' })),
     findings: approve ? [] : ['the behaviour does not match the criterion'],
   }));
@@ -121,7 +132,7 @@ test('full run: parallel dispatch, dependency order, failing test, targeted corr
   putContract(run, contract('A-001', { title: 'Add double', file_scope: ['lib/double.js'], verification_commands: ['node checks/double.js'], dependencies: ['C-001'] }));
   putContract(run, contract('B-001', { title: 'Add triple', file_scope: ['lib/triple.js'], verification_commands: ['node checks/triple.js'] }));
   putContract(run, contract('C-001', { title: 'Add combo', file_scope: ['lib/combo.js'], verification_commands: ['node checks/combo.js'], dependencies: ['A-001', 'B-001'] }));
-  putContract(run, contract('D-001', { title: 'Document helpers', assigned_role: 'documentation-worker', file_scope: ['README.md'], dependencies: ['C-001'], acceptance_criteria: ['README.md documents double, triple and combo'], verification: ['read the README against the code'] }));
+  putContract(run, contract('D-001', { title: 'Document helpers', risk_level: 'high', assigned_role: 'documentation-worker', file_scope: ['README.md'], dependencies: ['C-001'], acceptance_criteria: ['README.md documents double, triple and combo'], verification: ['read the README against the code'] }));
   const cyc = fo(repo, ['plan']);
   assert.equal(cyc.code, 2);
   assert.match(cyc.err, /dependency cycle/);
@@ -132,18 +143,20 @@ test('full run: parallel dispatch, dependency order, failing test, targeted corr
   assert.match(plan, /level 0: A-001, B-001\s+\(parallel candidates\)/);
   assert.match(plan, /level 1: C-001/);
   assert.match(plan, /level 2: D-001/);
-  assert.match(plan, /D-001\s+2\s+low\s+light\s+documentation-worker\s+haiku/);
+  assert.match(plan, /D-001\s+2\s+high\s+standard\s+documentation-worker\s+sonnet\/medium/);
 
   // two independent tasks go out together; the dependent ones wait
   const b1 = next(repo);
   assert.deepEqual(b1.specs.map((s) => s.task_id), ['A-001', 'B-001']);
-  assert.ok(b1.specs.every((s) => s.agent.isolation === 'worktree' && s.agent.model === 'haiku' && s.agent.subagent_type === 'implementation-worker'));
+  assert.ok(b1.specs.every((s) => s.agent.isolation === 'worktree' && s.agent.model === 'haiku' && s.agent.subagent_type === 'fable-orchestrator-implementation-worker'));
   assert.match(b1.specs[0].prompt, /## Acceptance criteria/);
   assert.match(b1.specs[0].prompt, /lib\/double\.js/);
   assert.equal(next(repo).specs.length, 0, 'nothing else is dispatchable while both run');
   ok(repo, ['started', 'A-001', 'B-001']);
+  assert.match(ok(repo, ['resume']), /worker liveness is unknown/);
+  assert.equal(next(repo).specs.length, 0);
 
-  const early = fo(repo, ['review', 'B-001', '--file', reviewFile(scratch, 'B-001', 1)]);
+  const early = fo(repo, ['review', 'B-001', '--file', reviewFile(repo, scratch, 'B-001', 1)]);
   assert.equal(early.code, 2, 'a running task cannot be reviewed');
 
   // A: correct implementation
@@ -153,7 +166,7 @@ test('full run: parallel dispatch, dependency order, failing test, targeted corr
   assert.match(verA, /PASS \[scope\] file scope/);
   assert.match(verA, /-> REVIEWING/);
   assert.equal(fo(repo, ['integrate', 'A-001']).code, 2, 'unreviewed work cannot be integrated');
-  const intA = ok(repo, ['review', 'A-001', '--file', reviewFile(scratch, 'A-001', 1), '--integrate']);
+  const intA = ok(repo, ['review', 'A-001', '--file', reviewFile(repo, scratch, 'A-001', 1), '--integrate']);
   assert.match(intA, /-> COMPLETED \(merge [0-9a-f]{10}\)/);
   const integration = stateOf(run).project.git.integration_branch;
   assert.match(git(repo, 'show', `${integration}:lib/double.js`), /double/);
@@ -165,7 +178,7 @@ test('full run: parallel dispatch, dependency order, failing test, targeted corr
   assert.match(verB, /FAIL \[command\] node checks\/triple\.js \(exit 1/);
   assert.match(verB, /triple\(3\) must be 9/, 'the failing output is shown so a targeted correction can be written');
   assert.match(verB, /-> CORRECTION_REQUIRED/);
-  const premature = fo(repo, ['review', 'B-001', '--file', reviewFile(scratch, 'B-001', 1)]);
+  const premature = fo(repo, ['review', 'B-001', '--file', reviewFile(repo, scratch, 'B-001', 1)]);
   assert.equal(premature.code, 2);
   assert.match(premature.err, /WRONG_STATE/, 'a failed test blocks approval');
   assert.equal(fo(repo, ['integrate', 'B-001']).code, 2);
@@ -185,7 +198,7 @@ test('full run: parallel dispatch, dependency order, failing test, targeted corr
     return ['lib/triple.js'];
   });
   assert.match(ok(repo, ['report', 'B-001', '--file', repB2, '--verify']), /-> REVIEWING/);
-  assert.match(ok(repo, ['review', 'B-001', '--file', reviewFile(scratch, 'B-001', 1), '--integrate']), /Now ready: C-001/);
+  assert.match(ok(repo, ['review', 'B-001', '--file', reviewFile(repo, scratch, 'B-001', 1), '--integrate']), /Now ready: C-001/);
 
   // C: depends on both; first attempt strays outside its scope
   const b3 = next(repo);
@@ -206,11 +219,11 @@ test('full run: parallel dispatch, dependency order, failing test, targeted corr
   ok(repo, ['started', 'C-001']);
   const repC2 = worker(repo, scratch, b4.specs[0], (dir) => { fs.unlinkSync(path.join(dir, 'lib', 'extra.js')); return ['lib/combo.js']; });
   assert.match(ok(repo, ['report', 'C-001', '--file', repC2, '--verify']), /-> REVIEWING/);
-  ok(repo, ['review', 'C-001', '--file', reviewFile(scratch, 'C-001', 1), '--integrate']);
+  ok(repo, ['review', 'C-001', '--file', reviewFile(repo, scratch, 'C-001', 1), '--integrate']);
 
   // D: documentation has no command; it needs a recorded manual check
   const b5 = next(repo);
-  assert.equal(b5.specs[0].agent.subagent_type, 'documentation-worker');
+  assert.equal(b5.specs[0].agent.subagent_type, 'fable-orchestrator-documentation-worker');
   ok(repo, ['started', 'D-001']);
   const repD = worker(repo, scratch, b5.specs[0], (dir) => { fs.appendFileSync(path.join(dir, 'README.md'), '\n## Helpers\n\n- double(x)\n- triple(x)\n- combo(x)\n'); return ['README.md']; },
     { verification: { tests_run: false, tests_passed: null, build_passed: null } });
@@ -220,7 +233,15 @@ test('full run: parallel dispatch, dependency order, failing test, targeted corr
   assert.match(noEvidence.err, /NO_VERIFICATION_EVIDENCE/);
   ok(repo, ['check', 'D-001', '--name', 'README documents the three helpers', '--result', 'pass', '--note', 'read README.md in the task checkout against lib/*.js']);
   assert.match(ok(repo, ['verify', 'D-001']), /PASS \[manual\] README documents the three helpers/);
-  const last = ok(repo, ['review', 'D-001', '--file', reviewFile(scratch, 'D-001', 1), '--integrate']);
+  ok(repo, ['review-package', 'D-001']);
+  const [dispatch] = currentTask(repo, 'D-001').review_dispatches;
+  const independent = yaml.dump({
+    task_id: 'D-001', reviewer: 'review-worker', perspective: dispatch.perspective, verdict: 'approve',
+    attempt_id: dispatch.attempt, review_dispatch_id: dispatch.id, candidate_commit: dispatch.candidate,
+    criteria: [{ met: true, evidence: 'reviewed README delta and the recorded manual check' }], findings: [],
+  });
+  ok(repo, ['review', 'D-001', '--agent-id', 'demo-docs-reviewer', '--stdin'], independent);
+  const last = ok(repo, ['review', 'D-001', '--file', reviewFile(repo, scratch, 'D-001', 1), '--integrate']);
   assert.match(last, /All tasks finished/);
   assert.match(ok(repo, ['next']), /NOTHING TO DISPATCH \(COMPLETE\)/);
 
@@ -234,6 +255,11 @@ test('full run: parallel dispatch, dependency order, failing test, targeted corr
   // delivery leaves the user's own changes alone
   const delivered = ok(repo, ['deliver']);
   assert.match(delivered, /DELIVERY: delivered/);
+  const final = stateOf(run).delivery;
+  assert.equal(final.head, final.verified.commit);
+  assert.equal(final.head, git(repo, 'rev-parse', 'HEAD'));
+  assert.equal(final.verified.tree, git(repo, 'rev-parse', 'HEAD^{tree}'));
+  assert.equal(final.head, stateOf(run).project.git.verified_integration.commit);
   for (const f of ['double.js', 'triple.js', 'combo.js']) assert.ok(fs.existsSync(path.join(repo, 'lib', f)));
   assert.ok(!fs.existsSync(path.join(repo, 'lib', 'extra.js')));
   assert.match(fs.readFileSync(path.join(repo, 'README.md'), 'utf8'), /combo\(x\)/);
@@ -248,7 +274,7 @@ test('full run: parallel dispatch, dependency order, failing test, targeted corr
   assert.match(report, /FAIL \[command\] node checks\/triple\.js/);
   assert.match(report, /Correction round 1: triple\(3\) returns 6/);
   assert.match(report, /B-001 Add triple \| COMPLETED \| implementation-worker \/ haiku \| 2 \| 1 \|/);
-  assert.match(report, /Agent dispatches recorded: 6/);
+  assert.match(report, /Agent dispatches recorded: 7/);
   assert.match(ok(repo, ['status']), /COMPLETE/);
 
   const clean = ok(repo, ['cleanup']);
@@ -259,21 +285,22 @@ test('full run: parallel dispatch, dependency order, failing test, targeted corr
   assert.match(ok(repo, ['learn']), /No proposal meets the evidence threshold yet/);
 });
 
-test('resume: tasks interrupted in flight are retried within the limit, then blocked; escalation changes the route', () => {
+test('resume holds in-flight work until the host confirms failure; retries are bounded', () => {
   const repo = mkRepo();
   const run = start(repo, 'Add a helper');
   putContract(run, contract('R-001', { file_scope: ['lib/helper.js'], verification_commands: ['node -e "process.exit(0)"'] }));
   ok(repo, ['plan']);
-  for (const expected of [/retry 1\/2/, /retry 2\/2/]) {
-    assert.equal(next(repo).specs.length, 1);
+  for (let i = 0; i < 3; i++) {
+    const [dispatch] = next(repo).specs;
+    assert.ok(dispatch);
     ok(repo, ['started', 'R-001']);
     const out = ok(repo, ['resume']);
-    assert.match(out, expected);
+    assert.match(out, /worker liveness is unknown/);
     assert.match(out, /ORIGINAL REQUEST:\s+Add a helper/);
+    assert.equal(next(repo).specs.length, 0);
+    assert.match(fo(repo, ['worker-failed', 'R-001', '--attempt-id', 'old', '--kind', 'crash', '--reason', 'old notification']).err, /STALE_ATTEMPT/);
+    ok(repo, ['worker-failed', 'R-001', '--attempt-id', dispatch.attempt_id, '--kind', 'crash', '--reason', 'host confirmed the agent exited']);
   }
-  next(repo);
-  ok(repo, ['started', 'R-001']);
-  assert.match(ok(repo, ['resume']), /R-001: was in flight when the run stopped -> BLOCKED/);
   assert.equal(stateOf(run).tasks['R-001'].block.kind, 'retries_exhausted');
   assert.equal(next(repo).specs.length, 0, 'a blocked task is not re-dispatched silently');
 
@@ -286,7 +313,7 @@ test('resume: tasks interrupted in flight are retried within the limit, then blo
   assert.equal(spec.attempt, 4);
 
   ok(repo, ['started', 'R-001']);
-  assert.match(ok(repo, ['worker-failed', 'R-001', '--kind', 'permission', '--reason', 'Bash was denied']), /-> BLOCKED/);
+  assert.match(ok(repo, ['worker-failed', 'R-001', '--attempt-id', spec.attempt_id, '--kind', 'permission', '--reason', 'Bash was denied']), /-> BLOCKED/);
   const late = fo(repo, ['report', 'R-001', '--file', path.join(run.runDir, 'request.md')]);
   assert.notEqual(late.code, 0, 'a report for a task that is no longer running is refused');
 });
@@ -324,13 +351,17 @@ test('independent review: the reviewer prompt is generated and the orchestrator 
   ok(repo, ['started', 'A-001']);
   const rep = worker(repo, scratch, spec, (dir) => { write(path.join(dir, 'lib', 'double.js'), 'exports.double = (x) => x * 2;\n'); return ['lib/double.js']; });
   assert.match(ok(repo, ['report', 'A-001', '--file', rep, '--verify']), /1 independent review\(s\) required first/);
-  assert.match(ok(repo, ['review', 'A-001', '--file', reviewFile(scratch, 'A-001', 1)]), /approval still needs 1 independent review-worker approval/);
+  assert.match(ok(repo, ['review', 'A-001', '--file', reviewFile(repo, scratch, 'A-001', 1)]), /approval still needs 1 independent review-worker approval/);
   const pkg = ok(repo, ['review-package', 'A-001']);
-  assert.match(pkg, /subagent_type=review-worker/);
+  assert.match(pkg, /subagent_type=fable-orchestrator-review-worker/);
   assert.match(pkg, /git diff [0-9a-f]{40}\.\.\.[0-9a-f]{40}/);
   const indep = path.join(scratch, 'indep.yaml');
-  fs.writeFileSync(indep, yaml.dump({ task_id: 'A-001', reviewer: 'review-worker', perspective: 'correctness', verdict: 'approve', criteria: [{ met: true, evidence: 'ran node checks/double.js: exit 0' }], findings: [] }));
-  assert.match(ok(repo, ['review', 'A-001', '--file', indep]), /A-001: APPROVED/);
+  const dispatch = currentTask(repo, 'A-001').review_dispatches[0];
+  fs.writeFileSync(indep, yaml.dump({ task_id: 'A-001', candidate_commit: dispatch.candidate, attempt_id: spec.attempt_id,
+    review_dispatch_id: dispatch.id, reviewer: 'review-worker', perspective: 'correctness', verdict: 'approve',
+    criteria: [{ met: true, evidence: 'recorded node checks/double.js exit 0' }], findings: [] }));
+  assert.match(fo(repo, ['review', 'A-001', '--file', indep, '--agent-id', 'worker-' + spec.attempt_id]).err, /INVALID_REVIEW_DISPATCH/);
+  assert.match(ok(repo, ['review', 'A-001', '--file', indep, '--agent-id', 'independent-agent']), /A-001: APPROVED/);
   assert.equal(stateOf(run).budget.agent_calls, 2, 'the reviewer dispatch is counted');
 });
 
@@ -355,7 +386,7 @@ test('limits: correction rounds and the agent-call budget stop the run and ask f
   assert.equal(st.tasks['B-001'].state, 'DISPATCHED');
   ok(repo, ['started', 'B-001']);
   const a2 = st.tasks['B-001'].attempts[1];
-  const again = worker(repo, scratch, { task_id: 'B-001', attempt: 2, prompt: a2.start_refs.map((r) => `git merge --no-edit ${r}`).join(' ') }, wrong);
+  const again = worker(repo, scratch, { task_id: 'B-001', attempt: 2, attempt_id: a2.attempt_id, prompt: a2.start_refs.map((r) => `git merge --no-edit ${r}`).join(' ') }, wrong);
   assert.match(ok(repo, ['report', 'B-001', '--file', again, '--verify']), /Correction limit reached: escalate to the user/);
   const limit = fo(repo, ['correct', 'B-001', '--file', correctionFile(scratch, 'B-001', 'still 6', 'multiply by 3')]);
   assert.equal(limit.code, 3);
@@ -392,7 +423,7 @@ test('integration: an interrupted merge is recovered; a merge conflict is aborte
   ok(repo, ['started', 'A-001']);
   const repA = worker(repo, scratch, sA, (dir) => { write(path.join(dir, 'lib', 'calc.js'), 'exports.add = (a, b) => a + b; // from A\n'); return ['lib/calc.js']; });
   assert.match(ok(repo, ['report', 'A-001', '--file', repA, '--verify']), /-> REVIEWING/);
-  assert.match(ok(repo, ['review', 'A-001', '--file', reviewFile(scratch, 'A-001', 1)]), /A-001: APPROVED/);
+  assert.match(ok(repo, ['review', 'A-001', '--file', reviewFile(repo, scratch, 'A-001', 1)]), /A-001: APPROVED/);
 
   // simulate a crash in the middle of integrating A: the state says INTEGRATING and a merge is half done
   const st = stateOf(run);
@@ -400,19 +431,26 @@ test('integration: an interrupted merge is recovered; a merge conflict is aborte
   git(integ, 'merge', '--no-ff', '--no-commit', st.tasks['A-001'].attempts[0].commit);
   st.tasks['A-001'].state = 'INTEGRATING';
   fs.writeFileSync(path.join(run.runDir, 'state.json'), JSON.stringify(st));
-  assert.match(ok(repo, ['resume']), /A-001: integration was interrupted -> APPROVED/);
-  assert.notEqual(spawnSync('git', ['rev-parse', '-q', '--verify', 'MERGE_HEAD'], { cwd: integ }).status, 0, 'the half-finished merge was aborted');
+  assert.match(ok(repo, ['resume']), /A-001: integration may still be active/);
+  assert.equal(spawnSync('git', ['rev-parse', '-q', '--verify', 'MERGE_HEAD'], { cwd: integ }).status, 0, 'resume preserved the half-finished merge');
+  assert.match(fo(repo, ['reconcile', 'A-001', '--reason', 'checked host']).err, /DIRTY_INTEGRATION/);
+  git(integ, 'merge', '--abort');
+  ok(repo, ['reconcile', 'A-001', '--reason', 'confirmed process exit and reconciled its worktree']);
   assert.match(ok(repo, ['integrate', 'A-001']), /-> COMPLETED/);
   const tipAfterA = git(integ, 'rev-parse', 'HEAD');
 
-  // B skips the "merge first" step and edits the same line from the old base: a real conflict
+  // Model an attempt assigned before another integration advanced the tip.
   const sB = next(repo).specs[0];
+  const assigned = stateOf(run);
+  const attempt = assigned.tasks['B-001'].attempts[0];
+  attempt.base = assigned.project.git.base_sha;
+  attempt.start_refs = [attempt.base];
+  fs.writeFileSync(path.join(run.runDir, 'state.json'), JSON.stringify(assigned));
   ok(repo, ['started', 'B-001']);
   const repB = worker(repo, scratch, sB, (dir) => { write(path.join(dir, 'lib', 'calc.js'), 'exports.add = (a, b) => b + a; // from B\n'); return ['lib/calc.js']; }, null, { skipMerge: true });
   const verB = ok(repo, ['report', 'B-001', '--file', repB, '--verify']);
-  assert.match(verB, /the initial merge was skipped/);
   assert.match(verB, /-> REVIEWING/);
-  const conflict = ok(repo, ['review', 'B-001', '--file', reviewFile(scratch, 'B-001', 1), '--integrate']);
+  const conflict = ok(repo, ['review', 'B-001', '--file', reviewFile(repo, scratch, 'B-001', 1), '--integrate']);
   assert.match(conflict, /CONFLICT \(merge aborted, nothing changed\): lib\/calc\.js/);
   assert.match(conflict, /-> CORRECTION_REQUIRED/);
   assert.equal(git(integ, 'rev-parse', 'HEAD'), tipAfterA, 'the integration branch is exactly as it was');
@@ -433,12 +471,13 @@ test('integration: an interrupted merge is recovered; a merge conflict is aborte
   git(dir, 'add', '-A');
   git(dir, 'commit', '-m', 'B-001: resolve the conflict with A-001');
   const rep2 = path.join(scratch, 'B-001-d2.report.yaml');
+  bind(repo, sB2, dir, 'wt-b-001-d2');
   fs.writeFileSync(rep2, yaml.dump({
-    task_id: 'B-001', status: 'implemented', summary: 'Merged the integration branch and resolved lib/calc.js', files_changed: ['lib/calc.js'],
+    task_id: 'B-001', attempt_id: sB2.attempt_id, status: 'implemented', summary: 'Merged the integration branch and resolved lib/calc.js', files_changed: ['lib/calc.js'],
     verification: { tests_run: true, tests_passed: true, build_passed: null }, known_issues: [], commit: git(dir, 'rev-parse', 'HEAD'), branch: 'wt-b-001-d2', worktree_path: dir,
   }));
   assert.match(ok(repo, ['report', 'B-001', '--file', rep2, '--verify']), /-> REVIEWING/);
-  assert.match(ok(repo, ['review', 'B-001', '--file', reviewFile(scratch, 'B-001', 1), '--integrate']), /-> COMPLETED/);
+  assert.match(ok(repo, ['review', 'B-001', '--file', reviewFile(repo, scratch, 'B-001', 1), '--integrate']), /-> COMPLETED/);
   assert.match(git(integ, 'show', 'HEAD:lib/calc.js'), /from A and B/);
   assert.match(ok(repo, ['deliver']), /DELIVERY: delivered/);
   assert.match(fs.readFileSync(path.join(repo, 'lib', 'calc.js'), 'utf8'), /from A and B/);
@@ -462,7 +501,7 @@ test('shared workspace fallback: no git, overlapping scopes serialized, out-of-s
   write(path.join(dir, 'src', 'a.js'), 'module.exports = 2;\n');
   write(path.join(dir, 'other.txt'), 'stray\n');
   const rep = path.join(dir, '..', `${path.basename(dir)}-report.yaml`);
-  fs.writeFileSync(rep, yaml.dump({ task_id: 'S-001', status: 'implemented', summary: 'changed a', files_changed: ['src/a.js'], verification: { tests_run: true, tests_passed: true, build_passed: null }, known_issues: [] }));
+  fs.writeFileSync(rep, yaml.dump({ task_id: 'S-001', attempt_id: batch.specs[0].attempt_id, status: 'implemented', summary: 'changed a', files_changed: ['src/a.js'], verification: { tests_run: true, tests_passed: true, build_passed: null }, known_issues: [] }));
   const ver = ok(dir, ['report', 'S-001', '--file', rep, '--verify']);
   assert.match(ver, /FAIL \[scope\] file scope - modified outside the authorized scope: other\.txt/);
   assert.match(ok(dir, ['deliver']), /DELIVERY: in_place/);
@@ -496,7 +535,7 @@ test('standard input: request, contracts, report, review and correction are all 
     yaml.dump(contract('B-001', { file_scope: ['lib/triple.js'], verification_commands: ['node checks/triple.js'] })),
   ].join('---\n');
   assert.match(ok(repo, ['plan', '--stdin'], docs), /level 0: A-001, B-001/);
-  assert.ok(fs.existsSync(path.join(runDir, 'tasks', 'A-001.yaml')) && fs.existsSync(path.join(runDir, 'tasks', 'B-001.yaml')));
+  assert.deepEqual(Object.keys(stateOf({ runDir }).plan_documents), ['A-001.yaml', 'B-001.yaml']);
   const bad = fo(repo, ['plan', '--stdin'], 'task_id: nope\ntitle: x\n');
   assert.equal(bad.code, 2);
   assert.match(bad.err, /task_id "nope" must look like/);
@@ -520,7 +559,7 @@ test('standard input: request, contracts, report, review and correction are all 
   const missing = fo(repo, ['review', 'A-001', '--integrate']);
   assert.equal(missing.code, 1);
   assert.match(missing.err, /--stdin \(pipe or heredoc\) or --file/);
-  const rv = yaml.dump({ task_id: 'A-001', reviewer: 'orchestrator', verdict: 'approve', criteria: [{ met: true, evidence: 'node checks/double.js exit 0; diff read' }], findings: [] });
+  const rv = yaml.dump({ task_id: 'A-001', reviewer: 'orchestrator', candidate_commit: currentTask(repo, 'A-001').verified_candidate.commit, verdict: 'approve', criteria: [{ met: true, evidence: 'node checks/double.js exit 0; diff read' }], findings: [] });
   assert.match(ok(repo, ['review', 'A-001', '--integrate', '--stdin'], rv), /-> COMPLETED/);
 
   const repB = fs.readFileSync(worker(repo, scratch, specs[1], (dir) => { write(path.join(dir, 'lib', 'triple.js'), 'exports.triple = (x) => x + x;\n'); return ['lib/triple.js']; }), 'utf8');
@@ -544,17 +583,112 @@ test('self-check and installer: files land in .claude, unmanaged agent files are
   assert.ok(fs.existsSync(path.join(target, '.claude', 'skills', 'fable-orchestrator', 'SKILL.md')));
   assert.ok(fs.existsSync(path.join(target, '.claude', 'skills', 'fable-orchestrator', 'scripts', 'fo.cjs')));
   for (const a of ['opus-executor', 'implementation-worker', 'research-worker', 'test-worker', 'debug-worker', 'integration-worker', 'documentation-worker']) {
-    assert.ok(fs.existsSync(path.join(target, '.claude', 'agents', `${a}.md`)), `${a} installed`);
+    assert.ok(fs.existsSync(path.join(target, '.claude', 'agents', `fable-orchestrator-${a}.md`)), `${a} installed`);
   }
-  assert.match(first.stdout, /review-worker\.md: SKIPPED/);
   assert.equal(fs.readFileSync(path.join(target, '.claude', 'agents', 'review-worker.md'), 'utf8'), 'my own reviewer\n');
-  assert.match(run(['--project', target]).stdout, /agent opus-executor\.md: up to date/);
+  assert.equal(run(['--project', target]).status, 0);
   assert.equal(run(['--project', target, '--force']).status, 0);
-  assert.match(fs.readFileSync(path.join(target, '.claude', 'agents', 'review-worker.md'), 'utf8'), /managed-by: fable-orchestrator/);
+  assert.equal(fs.readFileSync(path.join(target, '.claude', 'agents', 'review-worker.md'), 'utf8'), 'my own reviewer\n');
+  assert.match(fs.readFileSync(path.join(target, '.claude', 'agents', 'fable-orchestrator-review-worker.md'), 'utf8'), /managed-by: fable-orchestrator/);
   const installed = spawnSync(process.execPath, [path.join(target, '.claude', 'skills', 'fable-orchestrator', 'scripts', 'fo.cjs'), 'self-check', '--project', target], { encoding: 'utf8' });
   assert.equal(installed.status, 0, installed.stdout + installed.stderr);
   assert.match(installed.stdout, /ok\s+agent definitions installed/);
   const un = run(['--project', target, '--uninstall']);
   assert.equal(un.status, 0);
-  assert.ok(!fs.existsSync(path.join(target, '.claude', 'agents', 'opus-executor.md')));
+  assert.ok(!fs.existsSync(path.join(target, '.claude', 'agents', 'fable-orchestrator-opus-executor.md')));
+});
+
+test('native reports require an independently assigned clean worktree and a current attempt', () => {
+  const repo = mkRepo();
+  const foreign = mkRepo();
+  const scratch = tmp('fo-ownership-');
+  const run = start(repo, 'Add helper');
+  putContract(run, contract('A-001', { verification_commands: ['node --version'] }));
+  ok(repo, ['plan']);
+  const [spec] = next(repo).specs;
+  const file = worker(repo, scratch, spec, (dir) => { write(path.join(dir, 'lib', 'a.js'), 'exports.a = 1;\n'); return ['lib/a.js']; }, null, { unbound: true });
+  const report = yaml.parse(yaml.extractYamlBlock(fs.readFileSync(file, 'utf8')));
+  const submit = (update = {}) => fo(repo, ['report', 'A-001', '--stdin'], yaml.dump({ ...report, ...update }));
+  assert.match(submit().err, /assigned worktree/);
+  const claim = (dir, branch) => fo(repo, ['bind-worktree', 'A-001', '--attempt-id', spec.attempt_id, '--worktree', dir, '--branch', branch, '--agent-id', 'from-host']);
+  assert.match(claim(foreign, 'main').err, /WORKTREE_OWNERSHIP/);
+  assert.match(claim(report.worktree_path, 'other-branch').err, /WORKTREE_OWNERSHIP/);
+  bind(repo, spec, report.worktree_path, report.branch, 'from-host');
+  assert.match(submit({ attempt_id: 'previous-attempt' }).err, /STALE_ATTEMPT/);
+  assert.match(submit({ worktree_path: foreign }).err, /assigned worktree/);
+  write(path.join(report.worktree_path, 'lib', 'a.js'), 'exports.a = 2;\n');
+  write(path.join(report.worktree_path, 'untracked'), 'user work\n');
+  assert.match(submit().err, /uncommitted changes/);
+  assert.equal(git(report.worktree_path, 'rev-parse', 'HEAD'), report.commit);
+  fs.unlinkSync(path.join(report.worktree_path, 'untracked'));
+  git(report.worktree_path, 'restore', '--', 'lib/a.js');
+  assert.equal(submit().code, 0);
+  assert.match(submit().err, /WRONG_STATE/);
+  assert.equal(stateOf(run).tasks['A-001'].attempts[0].commit, report.commit);
+});
+
+test('verification cannot approve a command that mutates the candidate checkout', () => {
+  const repo = mkRepo();
+  const scratch = tmp('fo-mutating-check-');
+  const run = start(repo, 'Add helper');
+  const mutator = 'node -e "require(\'fs\').writeFileSync(\'lib/a.js\', \'different\')"';
+  putContract(run, contract('A-001', { verification_commands: [mutator, 'node --version'] }));
+  ok(repo, ['plan']);
+  const [spec] = next(repo).specs;
+  const file = worker(repo, scratch, spec, (dir) => { write(path.join(dir, 'lib', 'a.js'), 'exports.a = 1;\n'); return ['lib/a.js']; });
+  const out = ok(repo, ['report', 'A-001', '--file', file, '--verify']);
+  assert.match(out, /FAIL \[candidate\] candidate integrity/);
+  assert.match(out, /CORRECTION_REQUIRED/);
+  assert.doesNotMatch(out, /PASS \[command\] node --version/);
+  assert.equal(fs.readFileSync(path.join(scratch, 'A-001-d1', 'lib', 'a.js'), 'utf8'), 'exports.a = 1;\n');
+});
+
+test('a moved integration tip invalidates delivery and stale candidate reviews are refused', () => {
+  const repo = mkRepo();
+  const scratch = tmp('fo-stale-delivery-');
+  const run = start(repo, 'Add helper');
+  const original = git(repo, 'rev-parse', 'HEAD');
+  putContract(run, contract('A-001', { verification_commands: ['node --version'] }));
+  ok(repo, ['plan']);
+  const [spec] = next(repo).specs;
+  const file = worker(repo, scratch, spec, (dir) => { write(path.join(dir, 'lib', 'a.js'), 'exports.a = 1;\n'); return ['lib/a.js']; });
+  ok(repo, ['report', 'A-001', '--file', file, '--verify']);
+  const review = reviewFile(repo, scratch, 'A-001', 1);
+  const reviewData = yaml.parse(fs.readFileSync(review, 'utf8'));
+  assert.match(fo(repo, ['review', 'A-001', '--stdin'], yaml.dump({ ...reviewData, candidate_commit: original })).err, /STALE_EVIDENCE/);
+  ok(repo, ['review', 'A-001', '--file', review, '--integrate']);
+  const state = stateOf(run);
+  const integration = state.project.git.integration_path;
+  assert.equal(git(integration, 'rev-parse', 'HEAD'), state.project.git.verified_integration.commit);
+  git(integration, 'commit', '--allow-empty', '-m', 'Unverified new tip');
+  assert.match(ok(repo, ['deliver']), /integration tip differs/);
+  assert.equal(git(repo, 'rev-parse', 'HEAD'), original);
+});
+
+test('failed setup stops verification before the task checks', () => {
+  const repo = mkRepo();
+  const scratch = tmp('fo-failed-setup-');
+  write(path.join(repo, '.claude', 'fable-orchestrator', 'config.yaml'), 'integration:\n  setup_command: node -e "process.exit(17)"\n');
+  const run = start(repo, 'Add helper');
+  putContract(run, contract('A-001', { verification_commands: ['node --version'] }));
+  ok(repo, ['plan']);
+  const [spec] = next(repo).specs;
+  const file = worker(repo, scratch, spec, (dir) => { write(path.join(dir, 'lib', 'a.js'), 'exports.a = 1;\n'); return ['lib/a.js']; });
+  const out = ok(repo, ['report', 'A-001', '--file', file, '--verify']);
+  assert.match(out, /exit 17/);
+  assert.match(out, /CORRECTION_REQUIRED/);
+  assert.doesNotMatch(out, /node --version/);
+});
+
+test('an invalid submitted graph keeps the whole accepted plan intact', () => {
+  const repo = mkRepo();
+  const run = start(repo, 'Add helper');
+  const accepted = contract('A-001', {});
+  ok(repo, ['plan', '--stdin'], yaml.dump(accepted));
+  const before = stateOf(run);
+  const documents = [contract('A-001', { dependencies: ['B-001'] }), contract('B-001', { dependencies: ['A-001'] })];
+  const result = fo(repo, ['plan', '--stdin'], documents.map((item) => yaml.dump(item)).join('---\n'));
+  assert.match(result.err, /PLAN_INVALID/);
+  assert.deepEqual(stateOf(run), before);
+  assert.deepEqual(fs.readdirSync(run.tasks), []);
 });

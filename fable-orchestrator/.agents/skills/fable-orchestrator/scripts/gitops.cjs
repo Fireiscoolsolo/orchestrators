@@ -8,6 +8,8 @@
 const { spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
+const { dangerousCommand } = require('./validate.cjs');
 
 function git(cwd, args) {
   const r = spawnSync('git', args, { cwd, encoding: 'utf8', windowsHide: true, maxBuffer: 64 * 1024 * 1024 });
@@ -35,15 +37,20 @@ function toplevel(dir) {
 }
 
 function parseStatus(raw) {
-  return raw.split('\n').filter((l) => l.length > 3).map((l) => {
-    let p = l.slice(3).replace(/\r$/, '');
-    const arrow = p.indexOf(' -> ');
-    if (arrow >= 0) p = p.slice(arrow + 4);
-    return p.replace(/^"|"$/g, '');
-  });
+  return splitPaths(raw).map((record) => record.slice(3));
 }
 
-const dirtyFiles = (dir) => parseStatus(git(dir, ['status', '--porcelain']).raw);
+const splitPaths = (raw) => {
+  if (!raw) return [];
+  if (!raw.endsWith('\0') || raw.includes('\uFFFD')) throw new Error('Git path output is incomplete or cannot be decoded safely');
+  return raw.slice(0, -1).split('\0');
+};
+
+function dirtyFiles(dir) {
+  const r = git(dir, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--no-renames', '--ignore-submodules=none']);
+  if (r.code !== 0) throw new Error(`git status failed: ${r.err}`);
+  return parseStatus(r.raw);
+}
 
 function inspect(root) {
   if (git(root, ['rev-parse', '--is-inside-work-tree']).out !== 'true') return { enabled: false, reason: 'not a git repository' };
@@ -66,9 +73,37 @@ const branchExists = (cwd, name) => git(cwd, ['show-ref', '--verify', '-q', `ref
 
 /** Files changed on `commit` since it diverged from `base`. */
 function changedFiles(cwd, base, commit) {
-  const r = git(cwd, ['diff', '--name-only', `${base}...${commit}`]);
+  const r = git(cwd, ['diff', '--name-only', '-z', '--no-renames', '--ignore-submodules=none', `${base}...${commit}`, '--']);
   if (r.code !== 0) throw new Error(`git diff failed: ${r.err}`);
-  return r.out.split('\n').map((s) => s.trim()).filter(Boolean);
+  return splitPaths(r.raw);
+}
+
+const currentBranch = (dir) => git(dir, ['symbolic-ref', '--short', '-q', 'HEAD']).out || null;
+const candidate = (dir, ref) => {
+  const commit = revParse(dir, ref);
+  if (!commit) throw new Error(`Unable to resolve candidate commit ${ref}`);
+  const tree = must(dir, ['rev-parse', '--verify', `${commit}^{tree}`]);
+  return { commit, tree };
+};
+
+function samePath(a, b) {
+  const normalize = (p) => {
+    let resolved = path.resolve(p);
+    try { resolved = fs.realpathSync.native(resolved); } catch (e) { /* compare missing paths lexically */ }
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  };
+  return normalize(a) === normalize(b);
+}
+
+function repository(dir) {
+  const r = git(dir, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
+  return r.code === 0 && r.out ? fs.realpathSync.native(r.out) : null;
+}
+
+function registeredWorktrees(dir) {
+  const r = git(dir, ['worktree', 'list', '--porcelain', '-z']);
+  if (r.code !== 0) throw new Error(`git worktree list failed: ${r.err}`);
+  return splitPaths(r.raw).filter((s) => s.startsWith('worktree ')).map((s) => s.slice(9));
 }
 
 function worktreeAdd(root, dir, opts) {
@@ -80,11 +115,8 @@ function worktreeAdd(root, dir, opts) {
   return dir;
 }
 
-function worktreeRemove(root, dir, force) {
-  const args = ['worktree', 'remove'];
-  if (force) args.push('--force');
-  args.push(dir);
-  const r = git(root, args);
+function worktreeRemove(root, dir) {
+  const r = git(root, ['worktree', 'remove', dir]);
   return { ok: r.code === 0, message: r.err || r.out };
 }
 
@@ -92,16 +124,7 @@ function isWorktree(dir) {
   if (!dir || !fs.existsSync(dir)) return false;
   const top = toplevel(dir);
   if (!top) return false;
-  const real = (p) => { try { return fs.realpathSync.native(p); } catch (e) { return path.resolve(p); } };
-  return real(top).toLowerCase() === real(dir).toLowerCase();
-}
-
-/** Commit whatever the worker left uncommitted in its own worktree. Returns the new HEAD or null when clean. */
-function autoCommit(dir, message) {
-  if (!dirtyFiles(dir).length) return null;
-  must(dir, ['add', '-A']);
-  must(dir, identity(dir).concat(['commit', '-m', message]));
-  return must(dir, ['rev-parse', 'HEAD']);
+  return samePath(top, dir);
 }
 
 const mergeInProgress = (dir) => git(dir, ['rev-parse', '-q', '--verify', 'MERGE_HEAD']).code === 0;
@@ -156,10 +179,17 @@ function findShell() {
 
 function runCommand(cmd, cwd, timeoutMs) {
   const started = Date.now();
+  const refusal = dangerousCommand(cmd);
+  if (refusal) return { cmd, cwd, shell: null, exit_code: -1, timed_out: false,
+    error: `command refused: ${refusal}`, duration_ms: 0, stdout: '', stderr: '' };
   const sh = findShell();
+  const allowed = new Set(['PATH','PATHEXT','SYSTEMROOT','WINDIR','COMSPEC','TMP','TEMP','TMPDIR','HOME','USERPROFILE',
+    'HOMEDRIVE','HOMEPATH','APPDATA','LOCALAPPDATA','PROGRAMFILES','PROGRAMFILES(X86)','LANG','LC_ALL','TZ']);
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => allowed.has(key.toUpperCase())));
+  env.CI = '1';
   const opts = {
     cwd, encoding: 'utf8', windowsHide: true, timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024,
-    env: Object.assign({}, process.env, { CI: process.env.CI || '1' }),
+    env,
   };
   const r = sh ? spawnSync(sh.file, sh.args.concat(cmd), opts) : spawnSync(cmd, Object.assign({ shell: true }, opts));
   const timedOut = !!(r.error && r.error.code === 'ETIMEDOUT');
@@ -177,28 +207,30 @@ function runCommand(cmd, cwd, timeoutMs) {
 
 // --------------------------------------------------------------- snapshots
 
-const SKIP_DIRS = new Set(['.git', 'node_modules', '.claude', '.venv', 'venv', '__pycache__', 'dist', 'build', 'target', '.next', '.cache']);
+const RUNTIME_DIRS = new Set(['.claude/fable-orchestrator', '.fable-inbox']);
 
-/** Size+mtime fingerprint of the project tree, used for scope checks when git is unavailable. */
+/** Fingerprint files without following symlinks in shared workspaces. */
 function fsSnapshot(root, limit) {
   const max = limit || 20000;
-  const files = {};
+  const files = Object.create(null);
   let count = 0;
   let truncated = false;
   const walk = (dir, rel) => {
     let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return; }
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { truncated = true; return; }
     for (const e of entries) {
       if (truncated) return;
       const r = rel ? `${rel}/${e.name}` : e.name;
       if (e.isDirectory()) {
-        if (!SKIP_DIRS.has(e.name)) walk(path.join(dir, e.name), r);
-      } else if (e.isFile()) {
+        if (e.name !== '.git' && !RUNTIME_DIRS.has(r)) walk(path.join(dir, e.name), r);
+      } else {
         if (++count > max) { truncated = true; return; }
         try {
-          const st = fs.statSync(path.join(dir, e.name));
-          files[r] = `${st.size}:${Math.round(st.mtimeMs)}`;
-        } catch (err) { /* file vanished mid-walk */ }
+          const file = path.join(dir, e.name);
+          if (e.isSymbolicLink()) files[r] = `link:${fs.readlinkSync(file)}`;
+          else if (e.isFile()) files[r] = `${fs.lstatSync(file).mode}:${crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')}`;
+          else { truncated = true; return; }
+        } catch (err) { truncated = true; return; }
       }
     }
   };
@@ -216,6 +248,7 @@ function snapshotDiff(before, after) {
 
 module.exports = {
   git, must, available, toplevel, inspect, dirtyFiles, revParse, isAncestor, branchExists, changedFiles,
-  worktreeAdd, worktreeRemove, isWorktree, autoCommit, mergeInProgress, mergeAbort, mergeNoCommit, mergeCommit,
+  currentBranch, candidate, samePath, repository, registeredWorktrees,
+  worktreeAdd, worktreeRemove, isWorktree, mergeInProgress, mergeAbort, mergeNoCommit, mergeCommit,
   fastForward, branchDeleteMerged, findShell, runCommand, fsSnapshot, snapshotDiff,
 };

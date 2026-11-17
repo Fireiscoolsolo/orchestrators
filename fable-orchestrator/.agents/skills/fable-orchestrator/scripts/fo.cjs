@@ -20,12 +20,13 @@ const sched = require('./dependency_scheduler.cjs');
 const routing = require('./routing.cjs');
 const gitops = require('./gitops.cjs');
 const sm = require('./state_manager.cjs');
+const { readConfig, deepMerge } = require('./config.cjs');
 
 const { OrchError, nowIso } = sm;
 const SKILL_DIR = path.resolve(__dirname, '..');
 const RUNTIME = path.join('.claude', 'fable-orchestrator');
 // Drafts the orchestrator writes with its file tools. Claude Code treats .claude/ as a
-// sensitive path and refuses model writes there, which also keeps run state tamper-proof.
+// sensitive path and refuses model writes there, which helps prevent accidental edits to run state.
 const INBOX = '.fable-inbox';
 const INBOX_FILES = ['contracts.yaml', 'report.yaml', 'review.yaml', 'correction.yaml', 'request.txt'];
 const BOOL_FLAGS = new Set(['json', 'verify', 'integrate', 'reverify', 'user-authorized', 'all', 'plan-only', 'resume', 'status', 'help', 'stdin', 'force']);
@@ -68,7 +69,7 @@ function parseInvocation(raw) {
   let text = String(raw || '').replace(/^﻿/, '');
   text = text.replace(/(^|\s)--mode(?:=|[ \t]+)(\S+)/g, (m, pre, v) => {
     const mode = v.toLowerCase();
-    if (routing.MODES[mode]) out.mode = mode;
+    if (Object.hasOwn(routing.MODES, mode)) out.mode = mode;
     else out.errors.push(`--mode ${v}: expected fast, balanced, thorough or maximum`);
     return pre;
   });
@@ -110,34 +111,20 @@ function ctx(args) {
   let runId = args.flags.run;
   if (!runId) { try { runId = fs.readFileSync(path.join(rt, 'current'), 'utf8').trim(); } catch (e) { /* none */ } }
   if (!runId) throw new OrchError('NO_RUN', `no orchestration run in ${root}; start one with /fable-orchestrator <request>`, 1);
+  if (typeof runId !== 'string' || !/^\d{8}-\d{6}-[a-f0-9]{4}$/.test(runId)) {
+    throw new OrchError('BAD_RUN_ID', 'expected a run ID in YYYYMMDD-HHMMSS-xxxx format', 1);
+  }
   const runDir = path.join(rt, 'runs', runId);
   if (!fs.existsSync(runDir)) throw new OrchError('NO_RUN', `run ${runId} not found in ${rt}`, 1);
   return { root, rt, runId, runDir, store: new sm.Store(runDir) };
 }
 
-function deepMerge(base, over) {
-  if (!isObj(base) || !isObj(over)) return over === undefined ? base : over;
-  const out = Object.assign({}, base);
-  for (const [k, v] of Object.entries(over)) out[k] = isObj(v) && isObj(base[k]) ? deepMerge(base[k], v) : v;
-  return out;
-}
-
 function loadConfig(root) {
-  let cfg = yaml.parse(fs.readFileSync(path.join(SKILL_DIR, 'config.default.yaml'), 'utf8'));
-  const override = path.join(root, RUNTIME, 'config.yaml');
-  if (fs.existsSync(override)) cfg = deepMerge(cfg, yaml.parse(fs.readFileSync(override, 'utf8')) || {});
-  const bad = [];
-  if (!routing.MODES[cfg.execution.mode]) bad.push(`execution.mode "${cfg.execution.mode}"`);
-  for (const k of ['max_workers', 'max_review_rounds', 'max_task_retries']) {
-    if (!Number.isInteger(cfg.execution[k]) || cfg.execution[k] < 0) bad.push(`execution.${k}`);
+  try {
+    return readConfig(path.join(SKILL_DIR, 'config.default.yaml'), path.join(root, RUNTIME, 'config.yaml'));
+  } catch (error) {
+    throw new OrchError('BAD_CONFIG', error.message, 1);
   }
-  if (!['auto', 'native', 'managed', 'shared'].includes(cfg.isolation.strategy)) bad.push(`isolation.strategy "${cfg.isolation.strategy}"`);
-  for (const tier of routing.TIER_ORDER) {
-    const t = cfg.routing.tiers[tier];
-    if (!t || routing.MODEL_RANK[t.model] === undefined) bad.push(`routing.tiers.${tier}.model`);
-  }
-  if (bad.length) throw new OrchError('BAD_CONFIG', `invalid configuration: ${bad.join(', ')}`, 1);
-  return cfg;
 }
 
 function ensureRuntime(rt) {
@@ -214,7 +201,7 @@ function agentStatus(root) {
   const dirs = [path.join(root, '.claude', 'agents'), path.join(os.homedir(), '.claude', 'agents')];
   const missing = [];
   for (const role of V.ROLES.filter((r) => r !== 'orchestrator')) {
-    if (!dirs.some((d) => fs.existsSync(path.join(d, `${role}.md`)))) missing.push(role);
+    if (!dirs.some((d) => fs.existsSync(path.join(d, `fable-orchestrator-${role}.md`)))) missing.push(role);
   }
   return missing;
 }
@@ -284,7 +271,7 @@ function cmdInit(args) {
   let strategy = cfg.isolation.strategy;
   if (strategy === 'auto') strategy = g.enabled ? 'native' : 'shared';
   if (!g.enabled && strategy !== 'shared') { warnings.push(`isolation "${strategy}" needs git (${g.reason}); using the shared workspace`); strategy = 'shared'; }
-  if (strategy === 'shared') warnings.push(`shared workspace (${g.enabled ? 'configured' : g.reason}): no worktree isolation; overlapping file scopes are serialized and integration happens in place`);
+  if (strategy === 'shared') warnings.push(`shared workspace (${g.enabled ? 'configured' : g.reason}): no worktree isolation; tasks are serialized and integration happens in place`);
   const dirty = g.enabled ? g.dirty.filter((f) => !f.replace(/\\/g, '/').startsWith('.claude/')) : [];
   if (dirty.length && strategy !== 'shared') warnings.push(`uncommitted changes (${dirty.slice(0, 8).join(', ')}${dirty.length > 8 ? ', ...' : ''}) stay untouched in your checkout and are NOT visible to workers in worktrees`);
   const missing = agentStatus(root);
@@ -324,11 +311,12 @@ function cmdInit(args) {
 
 // ------------------------------------------------------------------ plan
 
-function readContractFiles(dir) {
+function readContractFiles(dir, documents) {
   const files = fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => /\.(ya?ml|json)$/i.test(f)).sort() : [];
-  return files.map((f) => {
+  return [...new Set([...files, ...Object.keys(documents)])].map((f) => {
     try {
-      const res = V.validateContract(yaml.parse(fs.readFileSync(path.join(dir, f), 'utf8')));
+      const content = Object.hasOwn(documents, f) ? documents[f] : fs.readFileSync(path.join(dir, f), 'utf8');
+      const res = V.validateContract(yaml.parse(content));
       return { file: f, errors: res.errors, warnings: res.warnings, contract: res.contract };
     } catch (e) {
       return { file: f, errors: [e.message], warnings: [], contract: null };
@@ -336,8 +324,9 @@ function readContractFiles(dir) {
   });
 }
 
-function planInto(state, c) {
-  const found = readContractFiles(path.join(c.runDir, 'tasks'));
+function planInto(state, c, submitted) {
+  const documents = { ...state.plan_documents, ...submitted };
+  const found = readContractFiles(path.join(c.runDir, 'tasks'), documents);
   if (!found.length) throw new OrchError('NO_CONTRACTS', `no task contracts yet: write them to ${path.join(c.root, INBOX, 'contracts.yaml')} and run fo plan --file <that file>`);
   const errors = [];
   const warnings = [];
@@ -433,14 +422,15 @@ function planInto(state, c) {
   if (notes.length) L.push('', 'ROUTING NOTES (basis: transparent heuristics; observed data only where stated):', ...notes.map((n) => `  - ${n}`));
   if (warnings.length) L.push('', 'WARNINGS:', ...warnings.map((w) => `  - ${w}`));
   const text = L.join('\n');
-  fs.writeFileSync(path.join(c.runDir, 'plan.md'), `# Plan\n\n\`\`\`text\n${text}\n\`\`\`\n`);
+  state.plan_documents = documents;
+  state.plan_summary = text;
   return `${text}\n\n${state.options.plan_only
     ? 'PLAN-ONLY: present this plan to the user and stop. Nothing is dispatched until they run /fable-orchestrator --resume.'
     : 'NEXT: `fo next` returns the first batch to dispatch.'}`;
 }
 
-/** Contracts given as YAML documents separated by `---` lines are saved as tasks/<TASK-ID>.yaml in the run. */
-function saveContracts(c, text, where) {
+/** Parse submitted drafts without writing until the entire graph is accepted. */
+function parseContracts(text, where) {
   const docs = text.split(/^---[ \t]*$/m).map((d) => d.trim()).filter(Boolean);
   if (!docs.length) throw new OrchError('BAD_ARGUMENTS', `no contracts found in ${where}`, 1);
   const out = [];
@@ -452,19 +442,19 @@ function saveContracts(c, text, where) {
     if (out.some((o) => o.id === id)) throw new OrchError('PLAN_INVALID', `contract ${i + 1} in ${where}: duplicate task_id ${id}`);
     out.push({ id, doc });
   });
-  for (const o of out) fs.writeFileSync(path.join(c.runDir, 'tasks', `${o.id}.yaml`), `${o.doc}\n`);
-  return out.length;
+  return Object.fromEntries(out.map((o) => [`${o.id}.yaml`, o.doc]));
 }
 
 function cmdPlan(args) {
   const c = ctx(args);
+  let submitted = {};
   if (args.flags.file !== undefined && args.flags.file !== true) {
     const file = path.resolve(String(args.flags.file));
-    saveContracts(c, fs.readFileSync(file, 'utf8'), file);
+    submitted = parseContracts(fs.readFileSync(file, 'utf8'), file);
   } else if (args.flags.stdin) {
-    saveContracts(c, fs.readFileSync(0, 'utf8'), 'standard input');
+    submitted = parseContracts(fs.readFileSync(0, 'utf8'), 'standard input');
   }
-  console.log(c.store.transact((state) => planInto(state, c)));
+  console.log(c.store.transact((state) => planInto(state, c, submitted)));
 }
 
 // -------------------------------------------------------------- dispatch
@@ -474,13 +464,16 @@ function ensureIntegration(state, c) {
   if (!g) return;
   const root = state.project.root;
   if (g.integration_branch) {
-    if (!gitops.isWorktree(g.integration_path) && gitops.branchExists(root, g.integration_branch)) {
-      gitops.git(root, ['worktree', 'prune']);
-      gitops.must(root, ['worktree', 'add', g.integration_path, g.integration_branch]);
+    if (!gitops.isWorktree(g.integration_path) || !sameRepo(root, g.integration_path) ||
+        gitops.currentBranch(g.integration_path) !== g.integration_branch) {
+      throw new OrchError('INTEGRATION_OWNERSHIP', 'integration worktree is absent or has changed identity; reconcile it before continuing');
     }
     return;
   }
   const head = gitops.revParse(root, 'HEAD');
+  if (head !== g.base_sha || gitops.currentBranch(root) !== g.base_branch) {
+    throw new OrchError('BASE_CHANGED', 'the project branch moved since planning; start a new run on the current base');
+  }
   const branch = `fable/${state.run_id}/integration`;
   const dir = path.join(c.runDir, 'integration');
   gitops.worktreeAdd(root, dir, { branch, start: head });
@@ -488,11 +481,6 @@ function ensureIntegration(state, c) {
   g.integration_branch = branch;
   g.integration_path = dir;
   sm.emit(state, { type: 'integration_created', branch, base: head });
-  const setup = state.config.integration.setup_command;
-  if (setup) {
-    const r = gitops.runCommand(setup, dir, state.config.verification.command_timeout_seconds * 1000);
-    sm.emit(state, { type: 'setup_command', exit_code: r.exit_code });
-  }
 }
 
 function newAttempt(state, c, t) {
@@ -502,7 +490,7 @@ function newAttempt(state, c, t) {
   const direct = t.route.role === 'orchestrator';
   const n = t.attempts.length + 1;
   const a = {
-    n, dispatched_at: nowIso(),
+    n, attempt_id: crypto.randomUUID(), dispatched_at: nowIso(),
     route: { tier: t.route.tier, role: t.route.role, model: t.route.model, effort: t.route.effort },
     isolation: reader ? 'none' : state.project.isolation,
     start_refs: [], base: null, workdir: null, read_path: null, snapshot: null,
@@ -511,10 +499,12 @@ function newAttempt(state, c, t) {
   };
   if (reader) {
     a.read_path = g && g.integration_path ? g.integration_path : root;
+    if (g) a.base = gitops.revParse(root, g.integration_branch);
   } else if (g) {
     const tip = gitops.revParse(root, g.integration_branch);
     const prev = [...t.attempts].reverse().find((p) => p.commit);
     a.base = tip;
+    a.repository = gitops.repository(root);
     if (prev) a.start_refs.push(prev.commit);
     a.start_refs.push(tip);
     if (state.project.isolation === 'managed' || direct) {
@@ -522,6 +512,10 @@ function newAttempt(state, c, t) {
       a.branch = `fable/${state.run_id}/${t.id}-a${n}`;
       a.workdir = path.join(c.runDir, 'wt', `${t.id}-a${n}`);
       gitops.worktreeAdd(root, a.workdir, { branch: a.branch, start: a.start_refs[0] });
+      a.worktree_path = a.workdir;
+      a.ownership = 'managed';
+    } else {
+      a.preexisting_worktrees = gitops.registeredWorktrees(root);
     }
   } else {
     const snap = gitops.fsSnapshot(root);
@@ -609,7 +603,7 @@ function buildPackage(state, t, a) {
     L.push('files_changed:', '  - <path relative to the repository root>');
     L.push('verification:', '  tests_run: true', '  tests_passed: true', '  build_passed: null      # true | false | null when not applicable', '  commands:', '    - cmd: <command you ran>', '      exit_code: 0');
   }
-  L.push('known_issues: []');
+  L.push(`attempt_id: ${a.attempt_id}`, 'known_issues: []');
   if (!reader && a.isolation !== 'shared') L.push('commit: <output of git rev-parse HEAD>', 'branch: <output of git branch --show-current>', 'worktree_path: <output of git rev-parse --show-toplevel>');
   L.push('reason: <only when status is blocked or failed>', '```');
   return L.join('\n');
@@ -626,13 +620,18 @@ function cmdNext(args) {
     let picked = { selected: [], deferred: [] };
     if (!budget.exceeded) {
       picked = sched.selectBatch(sm.schedulerViews(state), { maxWorkers: cap, maxNew: budget.remaining_calls });
+      if (!state.project.git) {
+        const held = Object.values(state.tasks).find((t) => sm.HOLD_STATES.includes(t.state));
+        const allowed = held ? 0 : 1;
+        for (const id of picked.selected.splice(allowed)) picked.deferred.push({ id, reason: 'shared workspace requires one active task at a time' });
+      }
       if (picked.selected.length) ensureIntegration(state, c);
     }
     const specs = [];
     for (const id of picked.selected) {
       const t = state.tasks[id];
-      if (t.contract.side_effects === 'external' && !t.authorized) {
-        picked.deferred.push({ id, reason: 'external side effects: user authorization not recorded (`fo authorize`)' });
+      if (t.contract.side_effects === 'external') {
+        picked.deferred.push({ id, reason: 'external action requires a host-authorized execution path; this CLI cannot authenticate approval' });
         continue;
       }
       const a = newAttempt(state, c, t);
@@ -640,9 +639,9 @@ function cmdNext(args) {
       const direct = a.route.role === 'orchestrator';
       if (!direct) state.budget.agent_calls++;
       specs.push({
-        task_id: id, attempt: a.n, direct, workdir: a.workdir,
+        task_id: id, attempt: a.n, attempt_id: a.attempt_id, direct, workdir: a.workdir,
         agent: direct ? null : {
-          subagent_type: a.route.role, model: a.route.model, effort: a.route.effort,
+          subagent_type: `fable-orchestrator-${a.route.role}`, model: a.route.model, effort: a.route.effort,
           isolation: a.isolation === 'native' ? 'worktree' : null,
           description: clip(`${id} ${t.contract.title}`, 60),
           fallback_role_file: path.join(SKILL_DIR, 'agents', `${a.route.role}.md`),
@@ -698,41 +697,70 @@ function cmdStarted(args) {
 // ---------------------------------------------------------------- report
 
 function sameRepo(root, dir) {
-  const q = (d) => gitops.git(d, ['rev-parse', '--path-format=absolute', '--git-common-dir']).out;
-  const a = q(root);
-  const b = q(dir);
-  return !!a && !!b && path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+  const a = gitops.repository(root);
+  const b = gitops.repository(dir);
+  return !!a && !!b && gitops.samePath(a, b);
+}
+
+function bindNativeWorktree(state, t, a, args) {
+  const root = state.project.root;
+  const dir = normalizeFsPath(needFlag(args, 'worktree'));
+  const branch = needFlag(args, 'branch');
+  const agent = needFlag(args, 'agent-id');
+  if (a.isolation !== 'native' || a.ownership) throw new OrchError('WORKTREE_OWNERSHIP', 'this attempt cannot be assigned a native worktree');
+  if (a.agent_id && a.agent_id !== agent) throw new OrchError('WORKTREE_OWNERSHIP', 'agent identity does not match the dispatch');
+  const excluded = [root, state.project.git.integration_path, ...(a.preexisting_worktrees || [])];
+  for (const task of Object.values(state.tasks)) {
+    for (const prior of task.attempts) if (prior.worktree_path) excluded.push(prior.worktree_path);
+  }
+  if (!a.repository || !gitops.isWorktree(dir) || !sameRepo(root, dir) ||
+      !gitops.samePath(a.repository, gitops.repository(dir)) ||
+      !gitops.registeredWorktrees(root).some((p) => gitops.samePath(p, dir)) ||
+      gitops.currentBranch(dir) !== branch || excluded.some((p) => p && gitops.samePath(p, dir))) {
+    throw new OrchError('WORKTREE_OWNERSHIP', `${t.id}: host worktree metadata does not identify a new, unassigned worktree for this repository`);
+  }
+  a.worktree_path = fs.realpathSync.native(dir);
+  a.branch = branch;
+  a.agent_id = agent;
+  a.ownership = 'host-recorded';
+}
+
+function cmdBindWorktree(args) {
+  const c = ctx(args);
+  const id = need(args, 0, 'task id');
+  const attempt = needFlag(args, 'attempt-id');
+  c.store.transact((state) => {
+    const t = sm.getTask(state, id);
+    const a = sm.lastAttempt(t);
+    if (!a || a.attempt_id !== attempt || !['DISPATCHED', 'RUNNING'].includes(t.state)) {
+      throw new OrchError('STALE_ATTEMPT', `${id}: no active dispatch matches ${attempt}`);
+    }
+    bindNativeWorktree(state, t, a, args);
+  });
+  console.log(`${id}: worktree ownership recorded`);
 }
 
 function locateWork(state, t, a, r, errors, warnings) {
   const root = state.project.root;
-  const wt = a.workdir || normalizeFsPath(r.worktree_path);
-  let commit = null;
-  if (wt && gitops.isWorktree(wt)) {
-    if (!sameRepo(root, wt)) { errors.push(`worktree ${wt} belongs to a different repository`); return; }
-    if (path.resolve(wt).toLowerCase() === path.resolve(root).toLowerCase()) { errors.push('the worker reported the main checkout as its worktree; isolated work is required'); return; }
-    const auto = gitops.autoCommit(wt, `${t.id}: uncommitted worker changes (committed by fable-orchestrator)`);
-    if (auto) warnings.push('the worker left uncommitted changes; fo committed them on the task branch');
-    commit = gitops.revParse(wt, 'HEAD');
-    a.worktree_path = wt;
-    a.branch = a.branch || r.branch || gitops.git(wt, ['symbolic-ref', '--short', '-q', 'HEAD']).out || null;
-    if (!auto && r.commit && commit && !commit.startsWith(r.commit.toLowerCase())) warnings.push(`reported commit ${r.commit} differs from the worktree HEAD ${short(commit)}; using HEAD`);
-  } else {
-    if (r.worktree_path) warnings.push(`worktree ${r.worktree_path} no longer exists; locating the work by commit or branch`);
-    if (r.commit) commit = gitops.revParse(root, r.commit);
-    if (!commit && r.branch) commit = gitops.revParse(root, r.branch);
-    a.branch = a.branch || r.branch || null;
+  const wt = a.worktree_path;
+  if (!a.ownership || !wt || !gitops.isWorktree(wt) || !sameRepo(root, wt) ||
+      !gitops.samePath(a.repository, gitops.repository(wt)) || gitops.currentBranch(wt) !== a.branch ||
+      !r.worktree_path || !gitops.samePath(wt, normalizeFsPath(r.worktree_path)) || r.branch !== a.branch) {
+    errors.push('report does not match the assigned worktree and branch; record native ownership from the host notification first');
+    return;
   }
-  if (!commit) {
-    if (r.files_changed.length) errors.push('the reported commit, branch and worktree cannot be found in this repository');
+  if (gitops.dirtyFiles(wt).length) {
+    errors.push('assigned worktree contains uncommitted changes; preserve it and reconcile with the worker');
+    return;
+  }
+  const commit = gitops.revParse(wt, 'HEAD');
+  if (!commit || r.commit.toLowerCase() !== commit || !a.start_refs.every((ref) => gitops.isAncestor(root, ref, commit))) {
+    errors.push('reported commit does not match the worker HEAD or is missing an assigned base commit');
     return;
   }
   a.commit = commit;
   a.changed_files = gitops.changedFiles(root, a.base, commit);
   if (!a.changed_files.length && r.files_changed.length) warnings.push('the report lists changed files but the commit holds no changes relative to the integration branch');
-  for (const ref of a.start_refs) {
-    if (!gitops.isAncestor(root, ref, commit)) warnings.push(`the work is not based on ${short(ref)} (the initial merge was skipped); integration will merge it`);
-  }
 }
 
 function workerFailure(state, c, t, kind, reason) {
@@ -757,15 +785,14 @@ function cmdReport(args) {
   const c = ctx(args);
   const id = need(args, 0, 'task id');
   const raw = yaml.parse(yaml.extractYamlBlock(readInput(args, 'the worker completion report')));
-  // What the harness says about the agent's worktree outranks what the worker wrote down.
-  if (isObj(raw)) {
-    if (args.flags.worktree && args.flags.worktree !== true) raw.worktree_path = String(args.flags.worktree);
-    if (args.flags.branch && args.flags.branch !== true) raw.branch = String(args.flags.branch);
-  }
   const res = c.store.transact((state) => {
     const t = sm.getTask(state, id);
     if (!['DISPATCHED', 'RUNNING'].includes(t.state)) throw new OrchError('WRONG_STATE', `${id} is ${t.state}; a completion report is accepted only while DISPATCHED or RUNNING`);
     const a = sm.lastAttempt(t);
+    if (!a || !a.attempt_id || !isObj(raw) || raw.attempt_id !== a.attempt_id ||
+        (args.flags['agent-id'] && args.flags['agent-id'] !== a.agent_id)) {
+      throw new OrchError('STALE_ATTEMPT', `${id}: report does not identify the current dispatch`);
+    }
     const g = state.project.git;
     const v = V.validateReport(raw, t, { git: !!g && a.isolation !== 'none' });
     const errors = v.errors.slice();
@@ -775,22 +802,23 @@ function cmdReport(args) {
       if (g) {
         locateWork(state, t, a, r, errors, warnings);
       } else if (a.snapshot) {
-        const before = JSON.parse(fs.readFileSync(a.snapshot, 'utf8')).files;
-        const diff = gitops.snapshotDiff(before, gitops.fsSnapshot(state.project.root).files);
+        const before = JSON.parse(fs.readFileSync(a.snapshot, 'utf8'));
+        const after = gitops.fsSnapshot(state.project.root);
+        if (before.truncated || after.truncated) throw new OrchError('INCOMPLETE_SCOPE', 'shared workspace snapshot was incomplete');
+        const diff = gitops.snapshotDiff(before.files, after.files);
         const mine = (f) => t.contract.file_scope.some((p) => sched.matchPath(p, f));
-        const others = Object.values(state.tasks).filter((o) => o.id !== id && sm.HOLD_STATES.includes(o.state));
         a.changed_files = diff.filter(mine);
-        a.out_of_scope = diff.filter((f) => !mine(f) && !others.some((o) => o.contract.file_scope.some((p) => sched.matchPath(p, f))));
+        a.out_of_scope = diff.filter((f) => !mine(f));
       }
     }
     if (errors.length) {
       throw new OrchError('INVALID_REPORT', [`${id}: completion report rejected (state unchanged):`].concat(errors.map((e) => `  - ${e}`),
-        ['Fix the transcription and resubmit, ask the worker for a corrected report, or record the failure: fo worker-failed ' + id + ' --kind invalid_output --reason "..."']).join('\n'));
+        [`Fix the report and resubmit, or after confirming the worker stopped record: fo worker-failed ${id} --attempt-id ${a.attempt_id} --kind invalid_output --reason "..."`]).join('\n'));
     }
     fs.writeFileSync(path.join(c.runDir, 'reports', `${id}-d${a.n}.yaml`), yaml.dump(r));
     a.report = r;
+    a.reconciliation_required = false;
     a.reported_at = nowIso();
-    if (args.flags['agent-id']) a.agent_id = String(args.flags['agent-id']);
     const tokens = Number(args.flags.tokens);
     if (Number.isFinite(tokens) && tokens > 0) { a.tokens = tokens; state.budget.tokens_reported += tokens; }
     if (r.delegations) state.budget.agent_calls += r.delegations;
@@ -818,6 +846,7 @@ function cmdReport(args) {
 function cmdWorkerFailed(args) {
   const c = ctx(args);
   const id = need(args, 0, 'task id');
+  const attempt = needFlag(args, 'attempt-id');
   const kind = needFlag(args, 'kind');
   const reason = needFlag(args, 'reason');
   const kinds = ['crash', 'invalid_output', 'permission', 'rate_limit', 'context', 'missing_tool', 'unsupported_model', 'timeout', 'other'];
@@ -825,6 +854,7 @@ function cmdWorkerFailed(args) {
   const st = c.store.transact((state) => {
     const t = sm.getTask(state, id);
     if (!['DISPATCHED', 'RUNNING'].includes(t.state)) throw new OrchError('WRONG_STATE', `${id} is ${t.state}; only a dispatched or running task can fail this way`);
+    if (sm.lastAttempt(t).attempt_id !== attempt) throw new OrchError('STALE_ATTEMPT', `${id}: failure does not identify the current dispatch`);
     return workerFailure(state, c, t, kind, reason);
   });
   observe(c, { category: 'worker_failure', task: id, text: `${kind}: ${reason}` });
@@ -852,21 +882,35 @@ function runAndRecord(c, id, cycle, tag, cmd, cwd, timeoutMs) {
   };
 }
 
-function checkoutFor(state, c, t, a) {
-  const root = state.project.root;
-  const g = state.project.git;
-  if (!g) return root;
-  if (!a || !a.commit) return g.integration_path && gitops.isWorktree(g.integration_path) ? g.integration_path : root;
-  if (a.worktree_path && gitops.isWorktree(a.worktree_path) && gitops.revParse(a.worktree_path, 'HEAD') === a.commit) return a.worktree_path;
-  const dir = path.join(c.runDir, 'wt', `${t.id}-verify-d${a.n}`);
-  if (gitops.isWorktree(dir)) {
-    if (gitops.revParse(dir, 'HEAD') === a.commit) return dir;
-    gitops.worktreeRemove(root, dir, true);
+function withCandidateCheckout(c, root, commit, use) {
+  const dir = fs.mkdtempSync(path.join(c.runDir, 'candidate-'));
+  gitops.worktreeAdd(root, dir, { detach: true, start: commit });
+  try {
+    return use(dir);
+  } finally {
+    gitops.worktreeRemove(root, dir, false);
   }
-  gitops.worktreeAdd(root, dir, { detach: true, start: a.commit });
-  const setup = state.config.integration.setup_command;
-  if (setup) gitops.runCommand(setup, dir, state.config.verification.command_timeout_seconds * 1000);
-  return dir;
+}
+
+function runCandidateChecks(c, id, cycle, tag, commands, dir, timeout, candidate, setup) {
+  const actual = () => gitops.candidate(dir, 'HEAD');
+  const intact = () => {
+    const current = actual();
+    return current.commit === candidate.commit && current.tree === candidate.tree && !gitops.dirtyFiles(dir).length;
+  };
+  const results = [];
+  if (intact()) {
+    const checks = [setup, ...commands].filter(Boolean);
+    for (const [i, cmd] of checks.entries()) {
+      const result = { ...runAndRecord(c, id, cycle, `${tag}${i + 1}`, cmd, dir, timeout), candidate };
+      results.push(result);
+      if (!intact() || i === 0 && setup && !result.passed) break;
+    }
+  }
+  const passed = intact();
+  results.push({ cycle, kind: 'candidate', name: 'candidate integrity', passed, at: nowIso(), candidate,
+    detail: passed ? `${candidate.commit} tree ${candidate.tree}` : 'candidate checkout or HEAD changed during verification' });
+  return results;
 }
 
 function extraCommands(args) {
@@ -899,17 +943,26 @@ function cmdVerify(args) {
       throw new OrchError('WRONG_STATE', `${id} is ${t.state}; verification starts from IMPLEMENTED`);
     }
     const a = sm.lastAttempt(t);
+    if (t.verification_operation) throw new OrchError('VERIFICATION_IN_PROGRESS', `${id}: a previous verifier may still be active`);
+    t.verification_operation = { id: crypto.randomUUID(), pid: process.pid };
+    const candidate = state.project.git ? gitops.candidate(state.project.root, a.commit || a.base) : null;
     return {
-      cmds: t.contract.verification_commands.concat(extra), cwd: checkoutFor(state, c, t, a), cycle: t.verify_cycle,
+      cmds: t.contract.verification_commands.concat(extra), cwd: state.project.root, cycle: t.verify_cycle,
+      setup: state.config.integration.setup_command, operation: t.verification_operation.id, candidate,
       timeout: state.config.verification.command_timeout_seconds * 1000,
     };
   });
 
-  const results = plan.cmds.map((cmd, i) => runAndRecord(c, id, plan.cycle, `v${i + 1}`, cmd, plan.cwd, plan.timeout));
+  const results = plan.candidate
+    ? withCandidateCheckout(c, plan.cwd, plan.candidate.commit, (dir) => runCandidateChecks(c, id, plan.cycle, 'v', plan.cmds, dir, plan.timeout, plan.candidate, plan.setup))
+    : plan.cmds.map((cmd, i) => runAndRecord(c, id, plan.cycle, `v${i + 1}`, cmd, plan.cwd, plan.timeout));
 
   const out = c.store.transact((state) => {
     const t = sm.getTask(state, id);
-    if (t.state !== 'VERIFYING' || t.verify_cycle !== plan.cycle) throw new OrchError('STATE_CHANGED', `${id} changed state while verification ran; re-run fo verify`);
+    if (t.state !== 'VERIFYING' || t.verify_cycle !== plan.cycle || t.verification_operation?.id !== plan.operation) {
+      throw new OrchError('STATE_CHANGED', `${id} changed state while verification ran; reconcile before retrying`);
+    }
+    delete t.verification_operation;
     const a = sm.lastAttempt(t);
     t.checks.push(...results);
     if (a && a.isolation !== 'none' && a.changed_files) {
@@ -920,20 +973,23 @@ function cmdVerify(args) {
       });
     }
     const cur = sm.currentChecks(t);
-    if (!cur.some((x) => x.kind !== 'scope')) {
-      throw new OrchError('NO_VERIFICATION_EVIDENCE', `${id}: nothing was verified. Record what you inspected with \`fo check ${id} --name "..." --result pass|fail --note "..."\`, add verification_commands (\`fo amend\`), or mark it unverified (\`fo block ${id} --kind unverified --reason "..."\`)`);
-    }
     const failed = cur.filter((x) => !x.passed);
+    if (!failed.length && !cur.some((x) => x.kind === 'manual' || x.kind === 'command' && plan.cmds.includes(x.cmd))) {
+      return { noEvidence: true };
+    }
     if (failed.length) {
       const claimed = a && a.report && a.report.verification && a.report.verification.tests_passed === true;
       if (claimed && failed.some((f) => f.kind === 'command')) observe(c, { category: 'claim_mismatch', task: id, text: 'worker reported passing tests; independent verification failed' });
       if (failed.some((f) => f.kind === 'scope')) observe(c, { category: 'scope_violation', task: id, text: failed.find((f) => f.kind === 'scope').detail });
       sm.transition(state, id, 'CORRECTION_REQUIRED', { reason: `verification failed: ${failed.map((f) => clip(f.name, 80)).join(', ')}` });
     } else {
+      t.verified_candidate = plan.candidate;
+      t.verified_commands = plan.cmds;
       sm.transition(state, id, 'REVIEWING', { reason: `${cur.length} check(s) passed` });
     }
     return { state: t.state, checks: cur, gate: sm.reviewGate(t), left: sm.maxRounds(state, t) - t.review_round, independent: t.route.review.independent };
   });
+  if (out.noEvidence) throw new OrchError('NO_VERIFICATION_EVIDENCE', `${id}: record a manual check or add verification commands before review`);
 
   const L = [`${id}: verification cycle ${plan.cycle} in ${plan.cwd}`];
   for (const k of out.checks) {
@@ -978,17 +1034,34 @@ function cmdReviewPackage(args) {
     const t = sm.getTask(state, id);
     if (t.state !== 'REVIEWING') throw new OrchError('WRONG_STATE', `${id} is ${t.state}; independent review happens in REVIEWING`);
     const done = new Set(sm.currentReviews(t).filter((r) => r.reviewer === 'review-worker').map((r) => r.perspective));
-    const perspective = String(args.flags.perspective || (t.route.review.perspectives || []).find((p) => !done.has(p)) || 'correctness');
+    const required = t.route.review.perspectives || [];
+    const perspective = String(args.flags.perspective || required.find((p) => !done.has(p)) || '');
+    if (!required.includes(perspective) || done.has(perspective)) throw new OrchError('INVALID_PERSPECTIVE', 'choose an outstanding required review perspective');
+    if (sm.budgetStatus(state).exceeded) throw new OrchError('BUDGET_LIMIT', 'agent-call budget is exhausted');
     const a = sm.lastAttempt(t);
+    const dispatch = { id: crypto.randomUUID(), perspective, cycle: t.verify_cycle, attempt: a.attempt_id,
+      candidate: t.verified_candidate?.commit || null, agent_id: null };
+    t.review_dispatches ||= [];
+    if (t.review_dispatches.some((d) => d.cycle === dispatch.cycle && d.perspective === perspective)) {
+      throw new OrchError('REVIEW_ALREADY_DISPATCHED', 'a review for this perspective has already been dispatched');
+    }
+    t.review_dispatches.push(dispatch);
     const k = t.contract;
-    const where = checkoutFor(state, c, t, a);
+    const where = state.project.root;
     const L = [`# Independent review of ${id}: ${k.title}   (perspective: ${perspective})`];
     L.push('You did not write this change. Judge it against the contract and the evidence, not against the author\'s summary. Do not modify any file.');
     L.push('', '## Contract', `Objective: ${k.objective}`, 'Acceptance criteria:');
     k.acceptance_criteria.forEach((x, i) => L.push(`${i + 1}. ${x}`));
     L.push(`Authorized file scope: ${k.file_scope.join(', ') || '(read-only task)'}`);
     L.push('', '## The change');
-    if (a && a.commit) L.push(`Checkout to read: ${where}`, `Diff: run \`git diff ${a.base}...${a.commit}\` inside that checkout.`, `Changed files: ${(a.changed_files || []).join(', ') || '(none)'}`);
+    if (a && a.commit) {
+      const diff = gitops.git(where, ['diff', '--no-ext-diff', '--no-textconv', '--no-color', `${a.base}...${a.commit}`, '--']);
+      if (diff.code !== 0) throw new OrchError('DIFF_UNAVAILABLE', 'could not generate the candidate review diff');
+      const evidence = path.join(c.runDir, 'evidence', `${id}-review-${dispatch.id}.diff`);
+      sm.writeAtomic(evidence, diff.raw);
+      L.push(`Read the diff at ${evidence} (generated by git diff ${a.base}...${a.commit}).`,
+        `Verified commit: ${a.commit}`, `Changed files: ${(a.changed_files || []).join(', ') || '(none)'}`);
+    }
     else L.push(`Project directory: ${where}`, `Changed files: ${(a && a.changed_files ? a.changed_files : []).join(', ') || '(see the worker summary)'}`);
     if (a && a.report) L.push(`Author summary (unverified): ${a.report.summary}`, `Known issues reported: ${a.report.known_issues.join('; ') || 'none'}`);
     L.push('', `## Verification already recorded (cycle ${t.verify_cycle})`);
@@ -997,16 +1070,18 @@ function cmdReviewPackage(args) {
     L.push(perspective === 'security'
       ? 'Trust boundaries, input validation, authentication and authorization paths, secrets handling, injection and path traversal, failure paths that leak data or fail open.'
       : 'Whether each criterion is really met; functional defects; regressions; files changed outside the scope; whether the tests would fail if the behaviour were wrong; error cases; maintainability; documentation accuracy.');
-    L.push('You may run read-only commands and the project tests. Executable evidence outranks opinion.');
+    L.push('Read the verification evidence already recorded. Report missing evidence instead of executing project code.');
     L.push('', '## Review report', 'End your final message with ONE fenced yaml block in exactly this shape:');
     L.push('```yaml', `task_id: ${id}`, 'reviewer: review-worker', `perspective: ${perspective}`, 'verdict: approve            # approve | reject', 'criteria:                   # one entry per acceptance criterion, in order');
     k.acceptance_criteria.forEach(() => L.push('  - met: true', '    evidence: <what you observed: file:line, command and result>'));
+    L.push(`review_dispatch_id: ${dispatch.id}`, `attempt_id: ${dispatch.attempt}`);
+    if (dispatch.candidate) L.push(`candidate_commit: ${dispatch.candidate}`);
     L.push('findings: []                # when rejecting: each defect, where it is, and why it matters', '```');
     state.budget.agent_calls++;
     sm.emit(state, { type: 'review_dispatched', task: id, perspective });
     return { text: L.join('\n'), model: t.route.tier.startsWith('lead') ? 'opus' : 'sonnet' };
   });
-  console.log(`REVIEW DISPATCH for ${id}\nAgent call: subagent_type=review-worker | model=${out.model} | description="Review ${id}"\n  if that agent type is unavailable: subagent_type=general-purpose and start the prompt with "First read ${path.join(SKILL_DIR, 'agents', 'review-worker.md')} and follow it."\n--- prompt: pass verbatim ---\n${out.text}\n--- end prompt ---\nThen pass the reviewer's yaml block to: fo review ${id} --stdin`);
+  console.log(`REVIEW DISPATCH for ${id}\nAgent call: subagent_type=fable-orchestrator-review-worker | model=${out.model} | description="Review ${id}"\n  If this restricted agent is unavailable, install it before dispatch.\n--- prompt: pass verbatim ---\n${out.text}\n--- end prompt ---\nThen pass the review YAML with the distinct host completion ID: fo review ${id} --agent-id <host ID> --stdin`);
 }
 
 function cmdReview(args) {
@@ -1019,6 +1094,24 @@ function cmdReview(args) {
     const v = V.validateReview(raw, t);
     if (v.errors.length) throw new OrchError('INVALID_REVIEW', [`${id}: review rejected (state unchanged):`].concat(v.errors.map((e) => `  - ${e}`)).join('\n'));
     const r = Object.assign({ cycle: t.verify_cycle, at: nowIso() }, v.review);
+    const candidate = t.verified_candidate?.commit || null;
+    if (state.project.git && (!candidate || raw.candidate_commit !== candidate)) {
+      throw new OrchError('STALE_EVIDENCE', 'review must identify the commit that passed verification');
+    }
+    if (r.reviewer === 'review-worker') {
+      const agent = needFlag(args, 'agent-id');
+      const dispatch = (t.review_dispatches || []).find((d) => d.id === raw.review_dispatch_id);
+      const author = sm.lastAttempt(t);
+      if (!dispatch || dispatch.agent_id || dispatch.cycle !== t.verify_cycle || dispatch.perspective !== r.perspective ||
+          dispatch.attempt !== author.attempt_id || dispatch.attempt !== raw.attempt_id || dispatch.candidate !== candidate ||
+          author.agent_id === agent || (t.review_dispatches || []).some((d) => d.agent_id === agent)) {
+        throw new OrchError('INVALID_REVIEW_DISPATCH', 'reviewer or dispatch identity is missing, reused, or does not match this verification');
+      }
+      dispatch.agent_id = agent;
+      r.reviewer_dispatch_id = dispatch.id;
+      r.reviewer_agent_id = agent;
+    }
+    r.candidate_commit = candidate;
     t.reviews.push(r);
     fs.writeFileSync(path.join(c.runDir, 'reviews', `${id}-c${t.verify_cycle}-${sm.currentReviews(t).length}.yaml`), yaml.dump(v.review));
     const gate = sm.reviewGate(t);
@@ -1115,48 +1208,76 @@ function cmdIntegrate(args) {
   const plan = c.store.transact((state) => {
     const t = sm.getTask(state, id);
     if (t.state !== 'APPROVED') throw new OrchError('WRONG_STATE', `${id} is ${t.state}; only APPROVED work is integrated`);
+    if (state.delivery_operation || Object.values(state.tasks).some((other) => other.state === 'INTEGRATING')) {
+      throw new OrchError('INTEGRATION_BUSY', 'another integration or delivery may still be active');
+    }
     ensureIntegration(state, c);
     sm.transition(state, id, 'INTEGRATING', { reason: 'integration started' });
+    t.integration_operation = { id: crypto.randomUUID(), pid: process.pid };
     const a = sm.lastAttempt(t);
     const g = state.project.git;
-    const cmds = t.contract.verification_commands.slice();
+    if (g && (!t.verified_candidate || t.verified_candidate.commit !== (a.commit || a.base))) {
+      throw new OrchError('STALE_EVIDENCE', 'approval lacks verification for the exact candidate; verify and review again');
+    }
+    if (g && (gitops.mergeInProgress(g.integration_path) || gitops.dirtyFiles(g.integration_path).length)) {
+      throw new OrchError('DIRTY_INTEGRATION', 'integration worktree requires manual reconciliation');
+    }
+    if (g && gitops.revParse(g.integration_path, 'HEAD') !== (g.verified_integration?.commit || g.base_sha)) {
+      throw new OrchError('INTEGRATION_MOVED', 'integration checkout contains code outside the last verified commit');
+    }
+    const cmds = (t.verified_commands || t.contract.verification_commands).slice();
     const policy = routing.MODES[state.options.mode].regression;
     const reg = state.config.integration.regression_command;
     const risky = t.contract.risk_level !== 'low' || t.contract.security_sensitive;
     if (reg && !cmds.includes(reg) && (policy === 'always' || (policy === 'risky' && risky))) cmds.push(reg);
     return {
       cmds: cmds.concat(extra), git: !!g, commit: a ? a.commit : null, dir: g ? g.integration_path : state.project.root,
+      root: state.project.root, tip: g ? gitops.revParse(g.integration_path, 'HEAD') : null, branch: g ? g.integration_branch : null,
+      setup: state.config.integration.setup_command, operation: t.integration_operation.id,
       cycle: t.verify_cycle, title: t.contract.title, timeout: state.config.verification.command_timeout_seconds * 1000,
     };
   });
 
-  let conflict = null;
-  let merged = false;
-  let already = false;
-  if (plan.git && plan.commit) {
-    gitops.mergeAbort(plan.dir); // leftovers of an interrupted integration
-    if (gitops.isAncestor(plan.dir, plan.commit, gitops.revParse(plan.dir, 'HEAD'))) {
-      already = true;
-    } else {
-      const m = gitops.mergeNoCommit(plan.dir, plan.commit);
-      if (!m.ok) { conflict = m; gitops.mergeAbort(plan.dir); } else merged = !m.noop;
-    }
-  }
-  const results = conflict ? [] : plan.cmds.map((cmd, i) => runAndRecord(c, id, plan.cycle, `i${i + 1}`, cmd, plan.dir, plan.timeout));
+  const trial = plan.git
+    ? withCandidateCheckout(c, plan.root, plan.tip, (dir) => {
+      const already = !!plan.commit && gitops.isAncestor(dir, plan.commit, plan.tip);
+      if (plan.commit && !already) {
+        const merge = gitops.mergeNoCommit(dir, plan.commit);
+        if (!merge.ok) {
+          gitops.mergeAbort(dir);
+          return { conflict: merge, results: [] };
+        }
+        if (!merge.noop) gitops.mergeCommit(dir, `Integrate ${id}: ${plan.title}\n\nFable-Run: ${c.runId}\nFable-Task: ${id}`);
+      }
+      const candidate = gitops.candidate(dir, 'HEAD');
+      const results = runCandidateChecks(c, id, plan.cycle, 'i', plan.cmds, dir, plan.timeout, candidate, plan.setup);
+      return { candidate, results, already };
+    })
+    : { results: [plan.setup, ...plan.cmds].filter(Boolean).map((cmd, i) => runAndRecord(c, id, plan.cycle, `i${i + 1}`, cmd, plan.dir, plan.timeout)) };
+  const { candidate, conflict, results, already } = trial;
   const failed = results.filter((r) => !r.passed);
   let mergeSha = null;
-  if (merged) {
-    if (failed.length) gitops.mergeAbort(plan.dir);
-    else mergeSha = gitops.mergeCommit(plan.dir, `Integrate ${id}: ${plan.title}\n\nFable-Run: ${c.runId}\nFable-Task: ${id}`);
-  }
 
   const out = c.store.transact((state) => {
     const t = sm.getTask(state, id);
-    if (t.state !== 'INTEGRATING') throw new OrchError('STATE_CHANGED', `${id} changed state during integration`);
+    if (t.state !== 'INTEGRATING' || t.integration_operation?.id !== plan.operation) throw new OrchError('STATE_CHANGED', `${id} changed state during integration`);
+    if (candidate && !failed.length) {
+      if (gitops.currentBranch(plan.dir) !== plan.branch || gitops.revParse(plan.dir, 'HEAD') !== plan.tip ||
+          gitops.dirtyFiles(plan.dir).length) throw new OrchError('INTEGRATION_MOVED', 'integration checkout changed while checks ran');
+      if (candidate.commit !== plan.tip) {
+        const ff = gitops.fastForward(plan.dir, candidate.commit);
+        if (!ff.ok || gitops.revParse(plan.dir, 'HEAD') !== candidate.commit) {
+          throw new OrchError('INTEGRATION_MOVED', 'could not advance integration to the verified commit');
+        }
+        mergeSha = candidate.commit;
+      }
+      state.project.git.verified_integration = candidate;
+    }
     t.integration = {
       cycle: plan.cycle, at: nowIso(), passed: !conflict && !failed.length, merge_commit: mergeSha, already_merged: already,
-      conflict_files: conflict ? conflict.conflicts : [], checks: results,
+      conflict_files: conflict ? conflict.conflicts : [], checks: results, candidate: candidate || null, commands: plan.cmds,
     };
+    delete t.integration_operation;
     if (t.integration.passed) {
       sm.transition(state, id, 'COMPLETED', { reason: mergeSha ? `merged into the integration branch as ${short(mergeSha)}` : already ? 'already on the integration branch; checks passed' : 'integration checks passed' });
       recordOutcome(c, state, t, true);
@@ -1173,7 +1294,7 @@ function cmdIntegrate(args) {
   const L = [`${id}: integration in ${plan.dir}`];
   if (conflict) L.push(`  CONFLICT (merge aborted, nothing changed): ${conflict.conflicts.join(', ')}`);
   for (const k of results) {
-    L.push(`  ${k.passed ? 'PASS' : 'FAIL'} ${k.name} (exit ${k.timed_out ? 'TIMEOUT' : k.exit_code}, ${k.evidence})`);
+    L.push(`  ${k.passed ? 'PASS' : 'FAIL'} ${k.name}${k.kind === 'command' ? ` (exit ${k.timed_out ? 'TIMEOUT' : k.exit_code}, ${k.evidence})` : ` - ${k.detail}`}`);
     if (!k.passed && k.output_tail) L.push(...k.output_tail.split('\n').map((l) => `      | ${l}`));
   }
   if (out.state === 'COMPLETED') {
@@ -1186,14 +1307,29 @@ function cmdIntegrate(args) {
 
 function cmdDeliver(args) {
   const c = ctx(args);
-  const pre = c.store.read();
+  const pre = c.store.transact((state) => {
+    if (state.delivery_operation || Object.values(state.tasks).some((t) => t.state === 'INTEGRATING')) {
+      throw new OrchError('INTEGRATION_BUSY', 'another integration or delivery may still be active');
+    }
+    state.delivery_operation = { id: crypto.randomUUID(), pid: process.pid };
+    return state;
+  });
   const g = pre.project.git;
-  let audit = null;
+  const target = g?.verified_integration;
+  let audit = [];
   const reg = pre.config.integration.regression_command;
-  if (g && g.integration_path && reg && ['thorough', 'maximum'].includes(pre.options.mode)) {
-    audit = runAndRecord(c, 'RUN', 0, 'final-audit', reg, g.integration_path, pre.config.verification.command_timeout_seconds * 1000);
+  if (target && gitops.revParse(pre.project.root, g.integration_branch) === target.commit) {
+    const commands = pre.order.flatMap((id) => {
+      const t = pre.tasks[id];
+      return t.state === 'COMPLETED' ? (t.integration?.commands || t.contract.verification_commands) : [];
+    });
+    if (reg) commands.push(reg);
+    const setup = pre.config.integration.setup_command;
+    audit = withCandidateCheckout(c, pre.project.root, target.commit, (dir) => runCandidateChecks(c, 'RUN', 0, 'final-audit-', [...new Set(commands)], dir, pre.config.verification.command_timeout_seconds * 1000, target, setup));
   }
   const out = c.store.transact((state) => {
+    if (state.delivery_operation?.id !== pre.delivery_operation.id) throw new OrchError('STATE_CHANGED', 'delivery state changed while checks ran');
+    delete state.delivery_operation;
     const sum = sm.summary(state);
     const gg = state.project.git;
     const open = state.order.filter((id) => !sm.TERMINAL.includes(state.tasks[id].state));
@@ -1201,8 +1337,10 @@ function cmdDeliver(args) {
       state.delivery = { status: 'in_place', at: nowIso(), detail: 'shared workspace: changes were made directly in the project directory' };
     } else if (!gg.integration_branch) {
       state.delivery = { status: 'nothing_to_deliver', at: nowIso() };
-    } else if (audit && !audit.passed) {
-      state.delivery = { status: 'not_delivered', at: nowIso(), branch: gg.integration_branch, reason: `final audit failed: ${audit.name} (exit ${audit.exit_code}, ${audit.evidence})` };
+    } else if (!target || !audit.length || gitops.revParse(state.project.root, gg.integration_branch) !== target.commit) {
+      state.delivery = { status: 'not_delivered', at: nowIso(), branch: gg.integration_branch, reason: 'integration tip differs from the recorded verified commit or has no verification' };
+    } else if (audit.some((check) => !check.passed)) {
+      state.delivery = { status: 'not_delivered', at: nowIso(), branch: gg.integration_branch, reason: `final audit failed: ${audit.filter((check) => !check.passed).map((check) => check.name).join(', ')}`, checks: audit };
     } else if (!state.config.integration.auto_deliver && !args.flags.force) {
       state.delivery = { status: 'not_delivered', at: nowIso(), branch: gg.integration_branch, reason: 'integration.auto_deliver is off: merge the integration branch yourself' };
     } else {
@@ -1211,9 +1349,9 @@ function cmdDeliver(args) {
       if (cur !== gg.base_branch) {
         state.delivery = { status: 'not_delivered', at: nowIso(), branch: gg.integration_branch, reason: `your checkout is on ${cur || 'a detached HEAD'} but the run started on ${gg.base_branch || 'a detached HEAD'}` };
       } else {
-        const ff = gitops.fastForward(root, gg.integration_branch);
-        state.delivery = ff.ok
-          ? { status: 'delivered', at: nowIso(), branch: gg.integration_branch, head: gitops.revParse(root, 'HEAD') }
+        const ff = gitops.fastForward(root, target.commit);
+        state.delivery = ff.ok && gitops.revParse(root, 'HEAD') === target.commit
+          ? { status: 'delivered', at: nowIso(), branch: gg.integration_branch, head: target.commit, verified: target, checks: audit }
           : { status: 'not_delivered', at: nowIso(), branch: gg.integration_branch, reason: `fast-forward refused (your branch moved, or local changes would be overwritten): ${clip(ff.output, 300)}` };
       }
     }
@@ -1224,7 +1362,7 @@ function cmdDeliver(args) {
   const d = out.d;
   const L = [`DELIVERY: ${d.status}`];
   if (d.status === 'delivered') L.push(`  ${g.base_branch} fast-forwarded to ${short(d.head)} (${out.sum.counts.COMPLETED} completed task(s)). Uncommitted changes in your checkout were left as they were.`);
-  if (d.reason) L.push(`  ${d.reason}`, `  The approved work is on branch ${d.branch}; merge it when ready (git merge ${d.branch}). Nothing was forced.`);
+  if (d.reason) L.push(`  ${d.reason}`, `  Inspect integration branch ${d.branch} and its recorded evidence before any manual merge.`);
   if (d.detail) L.push(`  ${d.detail}`);
   if (out.open.length) L.push(`  note: ${out.open.length} task(s) are not finished (${out.open.join(', ')}); only completed work is on the integration branch.`);
   L.push('NEXT: fo final-report');
@@ -1237,31 +1375,32 @@ function cmdCleanup(args) {
   c.store.transact((state) => {
     const g = state.project.git;
     if (!g) { L.push('  shared workspace: nothing to clean'); return; }
-    const root = state.project.root;
-    const wtDir = path.join(c.runDir, 'wt');
-    if (fs.existsSync(wtDir)) {
-      for (const d of fs.readdirSync(wtDir)) {
-        const dir = path.join(wtDir, d);
-        const managed = Object.values(state.tasks).some((t) => t.attempts.some((a) => a.workdir === dir && !sm.TERMINAL.includes(t.state)));
-        if (managed) { L.push(`  kept ${dir} (task still open)`); continue; }
-        const r = gitops.worktreeRemove(root, dir, true);
-        L.push(`  ${r.ok ? 'removed' : 'kept'} fo checkout ${d}${r.ok ? '' : `: ${r.message}`}`);
-      }
+    if (state.delivery_operation || Object.values(state.tasks).some((t) => t.state === 'INTEGRATING' || t.verification_operation)) {
+      throw new OrchError('WORKSPACE_BUSY', 'verification, integration, or delivery may still be active');
     }
+    const root = state.project.root;
     for (const t of Object.values(state.tasks)) {
       if (!sm.TERMINAL.includes(t.state)) continue;
       for (const a of t.attempts) {
-        if (a.worktree_path && !a.workdir && gitops.isWorktree(a.worktree_path)) {
-          const r = gitops.worktreeRemove(root, a.worktree_path, false);
-          L.push(`  ${r.ok ? 'removed' : 'kept'} worker worktree ${a.worktree_path}${r.ok ? '' : ` (${clip(r.message, 120)})`}`);
+        const dir = a.worktree_path;
+        if (!a.ownership || !a.report || !a.commit || !dir || !gitops.isWorktree(dir) ||
+            !sameRepo(root, dir) || gitops.currentBranch(dir) !== a.branch ||
+            gitops.revParse(dir, 'HEAD') !== a.commit || gitops.dirtyFiles(dir).length) {
+          if (dir && fs.existsSync(dir)) L.push(`  kept ${dir} for reconciliation`);
+          continue;
         }
-        if (a.branch && gitops.branchExists(root, a.branch)) {
+        const r = gitops.worktreeRemove(root, dir, false);
+        L.push(`  ${r.ok ? 'removed' : 'kept'} worker worktree ${dir}${r.ok ? '' : ` (${clip(r.message, 120)})`}`);
+        if (r.ok && a.branch && gitops.branchExists(root, a.branch) &&
+            gitops.revParse(root, a.branch) === a.commit && gitops.isAncestor(root, a.commit, gitops.revParse(root, 'HEAD'))) {
           const r = gitops.branchDeleteMerged(root, a.branch);
           L.push(`  ${r.ok ? 'deleted merged branch' : 'kept branch'} ${a.branch}${r.ok ? '' : ' (not merged into your branch, or still checked out)'}`);
         }
       }
     }
-    if (state.delivery && state.delivery.status === 'delivered' && g.integration_path) {
+    if (state.delivery?.status === 'delivered' && g.integration_path && gitops.isWorktree(g.integration_path) &&
+        sameRepo(root, g.integration_path) && gitops.currentBranch(g.integration_path) === g.integration_branch &&
+        gitops.revParse(g.integration_path, 'HEAD') === state.delivery.head && !gitops.dirtyFiles(g.integration_path).length) {
       const r = gitops.worktreeRemove(root, g.integration_path, false);
       L.push(`  ${r.ok ? 'removed' : 'kept'} integration worktree${r.ok ? '' : ` (${clip(r.message, 120)})`}`);
       if (r.ok) {
@@ -1271,7 +1410,6 @@ function cmdCleanup(args) {
     } else if (g.integration_branch) {
       L.push(`  kept integration branch ${g.integration_branch} (not delivered)`);
     }
-    gitops.git(root, ['worktree', 'prune']);
     sm.emit(state, { type: 'cleanup' });
   });
   console.log(L.join('\n'));
@@ -1389,8 +1527,7 @@ function cmdAuthorize(args) {
         t.extra_rounds += n;
         notes.push(`${n} more correction round(s) for ${t.id}`);
       } else {
-        t.authorized = true;
-        notes.push(`${t.id} authorized to run despite external side effects`);
+        throw new OrchError('HOST_APPROVAL_REQUIRED', 'the CLI cannot authenticate approval for external actions; use the host permission flow', 3);
       }
     }
     if (!notes.length) throw new OrchError('BAD_ARGUMENTS', 'nothing to authorize: give a task id, --extra-rounds N, or --extra-agent-calls N', 1);
@@ -1492,34 +1629,19 @@ function cmdResume(args) {
       notes.push('this was a plan-only run: resuming executes the accepted plan');
       sm.emit(state, { type: 'plan_approved' });
     }
-    const g = state.project.git;
-    const max = state.options.max_task_retries;
     for (const id of state.order) {
       const t = state.tasks[id];
       if (t.state === 'DISPATCHED' || t.state === 'RUNNING') {
         const a = sm.lastAttempt(t);
-        if (a) a.outcome = 'interrupted';
-        t.failures.push({ at: nowIso(), kind: 'interrupted', reason: 'the run was resumed while this task was in flight', attempt: a ? a.n : null });
-        if (t.contract.side_effects === 'external') {
-          sm.transition(state, id, 'BLOCKED', { kind: 'retry_unsafe', reason: 'interrupted while running with external side effects; confirm what already happened before re-running' });
-        } else if (t.retries < max) {
-          t.retries++;
-          sm.transition(state, id, 'READY', { reason: `interrupted in flight; retry ${t.retries}/${max}` });
-        } else {
-          sm.transition(state, id, 'BLOCKED', { kind: 'retries_exhausted', reason: 'interrupted in flight with no retries left' });
-        }
-        notes.push(`${id}: was in flight when the run stopped -> ${t.state}${t.state === 'READY' ? ` (retry ${t.retries}/${max})` : ''}`);
-      } else if (t.state === 'VERIFYING') {
-        t.checks = t.checks.filter((x) => x.cycle !== t.verify_cycle || x.kind === 'manual');
-        t.verify_cycle--;
-        sm.transition(state, id, 'IMPLEMENTED', { recovery: true, reason: 'verification was interrupted; it will run again' });
-        notes.push(`${id}: verification was interrupted -> IMPLEMENTED`);
+        if (a) a.reconciliation_required = true;
+        notes.push(`${id}: worker liveness is unknown; dispatch ${a?.attempt_id || 'from an older release'} retained. Check the host before accepting completion or recording worker failure.`);
+      } else if (t.state === 'VERIFYING' && t.verification_operation) {
+        notes.push(`${id}: verification may still be active. Confirm it stopped before running fo reconcile.`);
       } else if (t.state === 'INTEGRATING') {
-        if (g && g.integration_path && gitops.isWorktree(g.integration_path)) gitops.mergeAbort(g.integration_path);
-        sm.transition(state, id, 'APPROVED', { recovery: true, reason: 'integration was interrupted; any half-finished merge was aborted' });
-        notes.push(`${id}: integration was interrupted -> APPROVED`);
+        notes.push(`${id}: integration may still be active. Inspect its worktree before running fo reconcile.`);
       }
     }
+    if (state.delivery_operation) notes.push('Delivery may still be active. Inspect the destination checkout before running fo reconcile RUN.');
     sm.refresh(state);
     sm.emit(state, { type: 'resume' });
     return { notes, lost: c.store.recovered ? c.store.recovered.lost_events : [], text: statusText(state, c), request: state.request, decisions: state.decisions };
@@ -1531,6 +1653,42 @@ function cmdResume(args) {
   if (out.decisions.length) L.push('', 'DECISIONS SO FAR:', ...out.decisions.map((d) => `  - ${d.text}`));
   L.push('', out.text, '', `Contracts: ${path.join(c.runDir, 'tasks')}. Continue with the open actions; \`fo next\` returns dispatchable work.`);
   console.log(L.join('\n'));
+}
+
+function cmdReconcile(args) {
+  const c = ctx(args);
+  const id = need(args, 0, 'task id or RUN');
+  const reason = needFlag(args, 'reason');
+  const confirmStopped = (operation) => {
+    if (!operation?.pid) return;
+    try { process.kill(operation.pid, 0); } catch (e) { if (e.code === 'ESRCH') return; }
+    throw new OrchError('OPERATION_ACTIVE', `process ${operation.pid} may still own this operation`);
+  };
+  c.store.transact((state) => {
+    if (id === 'RUN') {
+      if (!state.delivery_operation) throw new OrchError('WRONG_STATE', 'no interrupted delivery is recorded');
+      confirmStopped(state.delivery_operation);
+      delete state.delivery_operation;
+    } else {
+      const t = sm.getTask(state, id);
+      if (t.state === 'VERIFYING' && t.verification_operation) {
+        confirmStopped(t.verification_operation);
+        delete t.verification_operation;
+      } else if (t.state === 'INTEGRATING') {
+        confirmStopped(t.integration_operation);
+        const dir = state.project.git?.integration_path;
+        if (dir && (gitops.mergeInProgress(dir) || gitops.dirtyFiles(dir).length)) {
+          throw new OrchError('DIRTY_INTEGRATION', 'reconcile the integration worktree before clearing the interrupted operation');
+        }
+        delete t.integration_operation;
+        sm.transition(state, id, 'APPROVED', { recovery: true, reason });
+      } else {
+        throw new OrchError('WRONG_STATE', `${id}: no interrupted verification or integration is recorded`);
+      }
+    }
+    sm.emit(state, { type: 'operation_reconciled', task: id, reason });
+  });
+  console.log(`${id}: interrupted operation reconciled`);
 }
 
 function cmdRecover(args) {
@@ -1656,8 +1814,9 @@ function cmdHelp() {
     '  plan --file F | --stdin        validate contracts (YAML documents separated by ---), build the dependency graph, route every task',
     '  next [--json]                  select and dispatch the next conflict-free batch',
     '  started ID...                  mark dispatched tasks as running',
-    '  report ID --stdin [--verify] [--tokens N] [--worktree PATH] [--branch NAME]   ingest a worker completion report',
-    '  worker-failed ID --kind K --reason R         record a crash, bad output, permission or rate-limit failure',
+    '  bind-worktree ID --attempt-id UUID --agent-id HOST_ID --worktree PATH --branch NAME   record native host ownership',
+    '  report ID --stdin [--verify] [--tokens N]   ingest a worker completion report with its attempt ID',
+    '  worker-failed ID --attempt-id UUID --kind K --reason R   record a confirmed failure',
     '  check ID --name N --result pass|fail --note T   record a manual verification check',
     '  verify ID [--cmd C]            run verification commands, check file scope, decide REVIEWING or CORRECTION_REQUIRED',
     '  review-package ID              prompt for an independent review-worker',
@@ -1667,16 +1826,16 @@ function cmdHelp() {
     '  deliver | cleanup              fast-forward your branch; remove finished worktrees and merged branches',
     '  block|unblock|fail|cancel|reopen|escalate|authorize|amend   task management (each needs --reason)',
     '  decision "text" | observe --category C --text T | learn',
-    '  status [--json] | resume | recover | final-report | runs | self-check | go | parse-args',
+    '  status [--json] | resume | reconcile ID --reason R | recover | final-report | runs | self-check | go | parse-args',
   ].join('\n'));
 }
 
 const COMMANDS = {
-  init: cmdInit, plan: cmdPlan, next: cmdNext, started: cmdStarted, report: cmdReport, 'worker-failed': cmdWorkerFailed,
+  init: cmdInit, plan: cmdPlan, next: cmdNext, started: cmdStarted, 'bind-worktree': cmdBindWorktree, report: cmdReport, 'worker-failed': cmdWorkerFailed,
   check: cmdCheck, verify: cmdVerify, 'review-package': cmdReviewPackage, review: cmdReview, correct: cmdCorrect,
   integrate: cmdIntegrate, deliver: cmdDeliver, cleanup: cmdCleanup, block: cmdBlock, unblock: cmdUnblock, fail: cmdFail,
   cancel: cmdCancel, reopen: cmdReopen, escalate: cmdEscalate, authorize: cmdAuthorize, amend: cmdAmend, decision: cmdDecision,
-  go: cmdGo, status: cmdStatus, resume: cmdResume, recover: cmdRecover, 'final-report': cmdFinalReport, runs: cmdRuns,
+  go: cmdGo, status: cmdStatus, resume: cmdResume, reconcile: cmdReconcile, recover: cmdRecover, 'final-report': cmdFinalReport, runs: cmdRuns,
   observe: cmdObserve, learn: cmdLearn, 'self-check': cmdSelfCheck, 'parse-args': cmdParseArgs, help: cmdHelp,
 };
 

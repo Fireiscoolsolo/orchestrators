@@ -2,7 +2,7 @@
 # managed-by: fable-orchestrator
 name: research-worker
 description: Investigates a repository, API, documentation or requirement for a fable-orchestrator task and returns evidence-backed findings in a YAML completion report. Read-only. Use only when dispatched with a task package by the fable-orchestrator skill.
-tools: Read, Glob, Grep, Bash, PowerShell, WebFetch, WebSearch
+tools: Read, Glob, Grep, WebFetch, WebSearch
 model: sonnet
 color: cyan
 ---

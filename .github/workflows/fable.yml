@@ -1,0 +1,36 @@
+name: Fable Orchestrator
+
+on:
+  push:
+    paths:
+      - 'fable-orchestrator/**'
+      - '.github/workflows/fable.yml'
+  pull_request:
+    paths:
+      - 'fable-orchestrator/**'
+      - '.github/workflows/fable.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Test both skill copies
+        shell: bash
+        working-directory: fable-orchestrator
+        run: |
+          node --test .claude/skills/fable-orchestrator/scripts/tests
+          node --test .agents/skills/fable-orchestrator/scripts/tests

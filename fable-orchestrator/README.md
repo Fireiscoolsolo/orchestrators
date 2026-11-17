@@ -1,38 +1,39 @@
 # Fable Orchestrator
 
-Fable Orchestrator takes a multi-part software request, builds a dependency graph of task contracts, routes tasks to worker agents, runs verification, and integrates reviewed changes. This experimental release preserves the implementation before the planned reliability and security hardening.
+Fable Orchestrator turns multi-step software requests into task contracts, routes them to workers, and tracks verification, review, corrections, and delivery. V1.1 is an experimental release candidate for supervised use in trusted repositories.
 
-## Install and run in Claude Code
+## Install
 
-The existing installation guide specifies Node.js 18 or newer, Git 2.31 or newer for worktree isolation, and Claude Code 2.1.302 or newer. Claude Code 2.1.302 is the host version used in the original validation. Bash or Git Bash is used for verification when available.
-
-From the repository root, install into an existing project with:
+Use Node.js 18 or later and Git 2.31 or later. On Windows, use Git Bash for project verification commands. From this directory, install into an existing Claude Code project:
 
 ```bash
-node fable-orchestrator/.claude/skills/fable-orchestrator/scripts/install.cjs --project "/path/to/project"
+node .claude/skills/fable-orchestrator/scripts/install.cjs --project "/path/to/project" --dry-run
+node .claude/skills/fable-orchestrator/scripts/install.cjs --project "/path/to/project"
 ```
 
-Add `--dry-run` to preview the files the installer would copy. Restart Claude Code if the installer created the skill or agent directories, then open the target project and invoke the skill:
+The installer registers agents as `fable-orchestrator-<role>` and records source-owned files in an installation manifest. It preserves edited or unrelated files and leaves any legacy generic agents in place. Stop active Fable runs before upgrading. If a legacy installation conflicts with owned paths, reconcile the reported files or install into a clean target. The skill's [installation guide](.claude/skills/fable-orchestrator/README.md) covers dry runs, updates, and uninstall.
+
+## Run
+
+Open the target project in Claude Code and start with a plan:
 
 ```text
-/fable-orchestrator --plan-only Add CSV export and update its tests.
+/fable-orchestrator --plan-only Add CSV export, test quoting and escaping, and update the usage guide.
 ```
 
-Review the plan and its commands before using `/fable-orchestrator --resume`. For additional options and configuration, see the [Claude Code skill guide](.claude/skills/fable-orchestrator/README.md).
+Review the tasks and commands, then use `/fable-orchestrator --resume`. For native isolated work, the orchestrator records the worktree and agent identity from the host before accepting the worker's report. Use Git-backed isolation for commit verification and exact delivery. Shared mode processes one task at a time and changes the project in place.
 
-## Tests
-
-From the repository root:
+## Verify
 
 ```bash
-node --test fable-orchestrator/.claude/skills/fable-orchestrator/scripts/tests
-node --test fable-orchestrator/.agents/skills/fable-orchestrator/scripts/tests
+node --test .claude/skills/fable-orchestrator/scripts/tests
+node --test .agents/skills/fable-orchestrator/scripts/tests
 ```
 
-The tests use Node.js and disposable Git repositories. Both commands exercise the same CLI code with simulated workers.
+The CLI tests use disposable repositories and worktrees, with workers and reviewers simulated. Claude Code is the integration target. The Codex role definitions and skill preview are experimental, and no Codex execution adapter is included.
 
-## Codex files
-
-The [.agents skill](.agents/skills/fable-orchestrator/SKILL.md) and [.codex agent definitions](.codex/agents/) preserve the existing partial Codex integration. The accompanying CLI and installer still use Claude Code paths. The installation instructions above are for Claude Code.
-
-See [known limitations](LIMITATIONS.md) for the reliability and host-compatibility findings.
+- [Architecture](ARCHITECTURE.md)
+- [Security and host permissions](SECURITY.md)
+- [Known limitations](LIMITATIONS.md)
+- [Changelog](CHANGELOG.md)
+- [Contributing](CONTRIBUTING.md)

@@ -5,7 +5,10 @@
  * read-only views (summary, checkpoint, final report) derived from that state.
  */
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const { randomUUID } = require('crypto');
+const { performance } = require('perf_hooks');
 const yaml = require('./miniyaml.cjs');
 
 const STATES = [
@@ -63,9 +66,42 @@ function renameWithRetry(from, to) {
 }
 
 function writeAtomic(file, text) {
-  const tmp = `${file}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, text);
-  renameWithRetry(tmp, file);
+  const tmp = `${file}.tmp-${randomUUID()}`;
+  const fd = fs.openSync(tmp, 'wx', 0o600);
+  try {
+    try {
+      fs.writeFileSync(fd, text);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    renameWithRetry(tmp, file);
+  } finally {
+    try { fs.unlinkSync(tmp); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  }
+}
+
+function readLock(file) {
+  try {
+    const owner = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (owner && typeof owner.token === 'string' && /^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/.test(owner.token)
+      && Number.isInteger(owner.pid) && owner.pid > 0 && owner.pid <= 0x7fffffff && typeof owner.host === 'string') {
+      return owner;
+    }
+  } catch (e) {
+    if (e.code !== 'ENOENT' && !(e instanceof SyntaxError)) throw e;
+  }
+  return null;
+}
+
+function ownerExited(owner) {
+  if (!owner || owner.host !== os.hostname()) return false;
+  try {
+    process.kill(owner.pid, 0);
+    return false;
+  } catch (e) {
+    return e.code === 'ESRCH';
+  }
 }
 
 function emit(state, ev) {
@@ -85,29 +121,62 @@ class Store {
     this.eventsPath = path.join(runDir, 'events.jsonl');
     this.snapDir = path.join(runDir, 'snapshots');
     this.recovered = null;
+    this.lockToken = null;
   }
 
-  lock() {
-    const deadline = Date.now() + 15000;
-    for (;;) {
-      try {
-        const fd = fs.openSync(this.lockPath, 'wx');
-        fs.writeSync(fd, `${process.pid} ${nowIso()}`);
-        fs.closeSync(fd);
-        return;
-      } catch (e) {
-        if (e.code !== 'EEXIST') throw e;
-        let age = 0;
-        try { age = Date.now() - fs.statSync(this.lockPath).mtimeMs; } catch (err) { continue; }
-        if (age > 30000) { try { fs.unlinkSync(this.lockPath); } catch (err) { /* raced */ } continue; }
-        if (Date.now() > deadline) throw new OrchError('LOCK_TIMEOUT', 'state is locked by another fo process', 1);
-        sleepMs(50);
+  lock(timeoutMs = 15000) {
+    if (this.lockToken) throw new OrchError('LOCK_REENTRANT', 'nested state transactions are unsupported', 1);
+    const deadline = performance.now() + timeoutMs;
+    const token = randomUUID();
+    const claim = `${this.lockPath}.claim-${token}`;
+    fs.writeFileSync(claim, JSON.stringify({ token, pid: process.pid, host: os.hostname() }), { flag: 'wx', mode: 0o600 });
+    try {
+      for (;;) {
+        try {
+          // Publish a complete owner record atomically. Other processes never see a partially written lock.
+          fs.linkSync(claim, this.lockPath);
+          this.lockToken = token;
+          return;
+        } catch (e) {
+          if (e.code !== 'EEXIST') throw e;
+          const owner = readLock(this.lockPath);
+          if (ownerExited(owner) && this.reap(owner)) continue;
+          if (performance.now() >= deadline) {
+            throw new OrchError('LOCK_TIMEOUT', 'state lock is active or its owner cannot be safely reconciled', 1);
+          }
+          sleepMs(50);
+        }
       }
+    } finally {
+      fs.unlinkSync(claim);
+    }
+  }
+
+  reap(owner) {
+    // Only one reaper can act on this token. Recheck after claiming to avoid removing a replacement lock.
+    const guard = `${this.lockPath}.reap-${owner.token}`;
+    try {
+      fs.mkdirSync(guard);
+    } catch (e) {
+      if (e.code === 'EEXIST') return false;
+      throw e;
+    }
+    try {
+      const current = readLock(this.lockPath);
+      if (!current || current.token !== owner.token || !ownerExited(current)) return false;
+      fs.unlinkSync(this.lockPath);
+      return true;
+    } finally {
+      fs.rmdirSync(guard);
     }
   }
 
   unlock() {
-    try { fs.unlinkSync(this.lockPath); } catch (e) { /* already gone */ }
+    const token = this.lockToken;
+    this.lockToken = null;
+    if (!token || readLock(this.lockPath)?.token !== token) return false;
+    fs.unlinkSync(this.lockPath);
+    return true;
   }
 
   snapshotFiles() {
@@ -136,17 +205,20 @@ class Store {
   save(state) {
     state.updated_at = nowIso();
     if (this.recovered) {
-      // keep the unreadable file as evidence instead of copying it over the good backup
-      try { if (fs.existsSync(this.statePath)) renameWithRetry(this.statePath, `${this.statePath}.corrupt-${Date.now()}`); } catch (e) { /* best effort */ }
+      // Preserve the unreadable file without moving the last readable backup or interrupting atomic replacement.
+      if (fs.existsSync(this.statePath)) {
+        writeAtomic(`${this.statePath}.corrupt-${randomUUID()}`, fs.readFileSync(this.statePath));
+      }
     } else if (fs.existsSync(this.statePath)) {
-      try { fs.copyFileSync(this.statePath, `${this.statePath}.bak`); } catch (e) { /* best effort */ }
+      writeAtomic(`${this.statePath}.bak`, fs.readFileSync(this.statePath));
     }
+    const shouldSnapshot = (state.seq || 0) - (state.snapshot_seq || 0) >= 10;
+    if (shouldSnapshot) state.snapshot_seq = state.seq;
     writeAtomic(this.statePath, JSON.stringify(state, null, 1));
-    if ((state.seq || 0) - (state.snapshot_seq || 0) >= 10) {
+    if (shouldSnapshot) {
       try {
         fs.mkdirSync(this.snapDir, { recursive: true });
-        state.snapshot_seq = state.seq;
-        fs.writeFileSync(path.join(this.snapDir, `state-${String(state.seq).padStart(8, '0')}.json`), JSON.stringify(state));
+        writeAtomic(path.join(this.snapDir, `state-${String(state.seq).padStart(8, '0')}.json`), JSON.stringify(state));
         for (const old of this.snapshotFiles().slice(5)) fs.unlinkSync(old);
       } catch (e) { /* snapshots are a convenience */ }
     }
@@ -155,22 +227,105 @@ class Store {
 
   create(state) {
     fs.mkdirSync(this.runDir, { recursive: true });
-    emit(state, { type: 'run_created' });
-    this.save(state);
-    this.appendEvents(state._events);
-  }
-
-  appendEvents(events) {
-    if (events && events.length) fs.appendFileSync(this.eventsPath, events.map((e) => JSON.stringify(e)).join('\n') + '\n');
-  }
-
-  /** Lost events: those logged after the state we recovered to. */
-  eventsAfter(seq) {
+    this.lock();
     try {
-      return fs.readFileSync(this.eventsPath, 'utf8').split('\n').filter(Boolean)
-        .map((l) => { try { return JSON.parse(l); } catch (e) { return null; } })
-        .filter((e) => e && e.seq > seq);
-    } catch (e) { return []; }
+      if (fs.existsSync(this.statePath) || fs.existsSync(`${this.statePath}.bak`) || fs.existsSync(this.eventsPath)) {
+        throw new OrchError('RUN_EXISTS', 'run files already exist', 1);
+      }
+      emit(state, { type: 'run_created' });
+      this.commit(state);
+    } finally {
+      this.unlock();
+    }
+  }
+
+  eventLogTail() {
+    let fd;
+    try {
+      fd = fs.openSync(this.eventsPath, 'r');
+    } catch (e) {
+      if (e.code === 'ENOENT') return { offset: 0, separator: '' };
+      throw e;
+    }
+    try {
+      const offset = fs.fstatSync(fd).size;
+      const last = Buffer.alloc(1);
+      if (offset && fs.readSync(fd, last, 0, 1, offset - 1) !== 1) {
+        throw new OrchError('EVENT_LOG_DIVERGED', 'could not read the final byte of the event log', 1);
+      }
+      // Legacy or recovered logs can end in an incomplete record. Preserve that record as evidence.
+      return { offset, separator: offset && last[0] !== 10 ? '\n' : '' };
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+
+  commit(state) {
+    delete state.event_batch;
+    if (state._events?.length) {
+      const { offset, separator } = this.eventLogTail();
+      state.event_batch = {
+        offset,
+        text: separator + state._events.map((event) => JSON.stringify(event) + '\n').join(''),
+      };
+    }
+    this.save(state);
+    try {
+      this.flushEvents(state);
+    } catch (e) {
+      throw new OrchError('STATE_COMMITTED_LOG_PENDING', `state was committed but the event log could not be completed: ${e.message}. Run fo recover when the log is writable again.`, 1);
+    }
+  }
+
+  /** Replay only the missing suffix of the committed batch after interruption. */
+  flushEvents(state) {
+    if (!state.event_batch) return;
+    const { offset, text } = state.event_batch;
+    if (!Number.isSafeInteger(offset) || offset < 0 || typeof text !== 'string' || !text.endsWith('\n')) {
+      throw new OrchError('EVENT_LOG_DIVERGED', 'state contains an invalid event batch', 1);
+    }
+    const data = Buffer.from(text);
+    const fd = fs.openSync(this.eventsPath, 'a+', 0o600);
+    try {
+      const written = fs.fstatSync(fd).size - offset;
+      if (written < 0 || written > data.length) {
+        throw new OrchError('EVENT_LOG_DIVERGED', 'event log length does not match the last committed batch', 1);
+      }
+      const existing = Buffer.alloc(written);
+      let loaded = 0;
+      while (loaded < existing.length) {
+        const bytesRead = fs.readSync(fd, existing, loaded, existing.length - loaded, offset + loaded);
+        if (bytesRead === 0) break;
+        loaded += bytesRead;
+      }
+      if (loaded !== written || !existing.equals(data.subarray(0, written))) {
+        throw new OrchError('EVENT_LOG_DIVERGED', 'event log content does not match the last committed batch', 1);
+      }
+      if (written < data.length) fs.writeFileSync(fd, data.subarray(written));
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+
+  /** Preserve existing log evidence while avoiding duplicate sequence numbers after fallback. */
+  reconcileRecoveredEvents(state) {
+    let log = '';
+    try { log = fs.readFileSync(this.eventsPath, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+    const lost = [];
+    for (const line of log.split('\n').filter(Boolean)) {
+      try {
+        const event = JSON.parse(line);
+        if (Number.isSafeInteger(event?.seq) && event.seq > this.recovered.seq) {
+          lost.push(event);
+          state.seq = Math.max(state.seq || 0, event.seq);
+        }
+      } catch (e) {
+        if (!(e instanceof SyntaxError)) throw e;
+      }
+    }
+    this.recovered.lost_events = lost;
+    emit(state, { type: 'recovery', from: this.recovered.from, lost: lost.length });
   }
 
   /** Lock, load, mutate, save. If fn throws nothing is written. */
@@ -180,14 +335,11 @@ class Store {
       this.recovered = null;
       const state = this.load();
       Object.defineProperty(state, '_events', { value: [], enumerable: false, writable: true });
-      if (this.recovered) {
-        const lost = this.eventsAfter(this.recovered.seq);
-        this.recovered.lost_events = lost;
-        emit(state, { type: 'recovery', from: this.recovered.from, lost: lost.length });
-      }
+      if (this.recovered) this.reconcileRecoveredEvents(state);
+      else this.flushEvents(state);
       const result = fn(state);
-      this.save(state);
-      this.appendEvents(state._events);
+      if (result && typeof result.then === 'function') throw new OrchError('ASYNC_TRANSACTION', 'state transaction must finish synchronously', 1);
+      this.commit(state);
       return result;
     } finally {
       this.unlock();

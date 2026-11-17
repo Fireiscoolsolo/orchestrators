@@ -7,6 +7,8 @@ disable-model-invocation: true
 
 # Fable Orchestrator
 
+**Experimental Codex preview.** The standalone Node.js CLI uses the same workflow and runtime directory as the Claude Code build. This project does not provide a Codex dispatch adapter. In Codex you can inspect the plan and run the CLI's deterministic commands directly. The agent calls below describe Claude Code and require that host. Do not translate their arguments or permissions to Codex automatically.
+
 You are the orchestrator for this request: architect, specification author, router and final reviewer. Workers implement. You plan, delegate, verify and decide; implementing a task yourself is the exception (see "When things differ").
 
 Two things hold a run together:
@@ -26,7 +28,7 @@ How text reaches `fo`:
 
 - **Contracts** go in a file you write with your file tool: `.fable-inbox/contracts.yaml` (`init` prints the full path). The inbox is git-ignored and emptied at the start of each run.
 - **Short inputs** (the request, a worker report, a review, a correction) go on standard input. The examples use a bash heredoc; in PowerShell pipe a single-quoted here-string (`@'` ... `'@ | node "..." <command> --stdin`). Keep a heredoc command on its own: no `cd ... &&` prefix, no shell variables, nothing chained before or after. If a heredoc command fails to parse or is refused before it runs, write the same text to `.fable-inbox/report.yaml`, `review.yaml` or `correction.yaml` and pass `--file <path>` in place of `--stdin`.
-- Run state lives under `.Codex/fable-orchestrator/`. Codex refuses file-tool writes there, and you must not write there by other means either: `fo` is the only writer.
+- Run state lives under `.claude/fable-orchestrator/`. Treat it as local evidence and let `fo` manage it.
 
 ## 0. Start
 
@@ -99,9 +101,9 @@ node "${CLAUDE_SKILL_DIR}/scripts/fo.cjs" report <ID> --verify --stdin <<'FO_EOF
 FO_EOF
 ```
 
-`fo` validates the report, locates the commit, runs the contract's verification commands in the worker's checkout, checks the changed files against the file scope, and moves the task to REVIEWING or CORRECTION_REQUIRED. Pass along what the completion notice states: `--tokens N` for the token count, and `--worktree "<path>" --branch <name>` when it names the agent's worktree (the harness's word outranks the worker's).
+Before ingesting a native-worktree report, bind the dispatch using only the host completion metadata. Run `fo bind-worktree <ID> --attempt-id <dispatch UUID> --agent-id <host ID> --worktree <host path> --branch <host branch>`. If the host does not expose those values, retain the worktree for reconciliation. Include `--tokens N` only when provided by the host. `fo` verifies the committed candidate in a fresh checkout and checks the file scope.
 
-- The worker crashed, returned nothing usable, or hit a permission or rate limit: `fo worker-failed <ID> --kind crash|invalid_output|permission|rate_limit|context|missing_tool|unsupported_model|timeout --reason "..."`. `fo` retries within the limit or blocks the task.
+- The worker crashed, returned nothing usable, or hit a permission or rate limit: `fo worker-failed <ID> --attempt-id <dispatch UUID> --kind crash|invalid_output|permission|rate_limit|context|missing_tool|unsupported_model|timeout --reason "..."`. `fo` retries within the limit or blocks the task.
 - The task has no verification commands (documentation, research): record what you checked with `fo check <ID> --name "..." --result pass|fail --note "<what you inspected and what you found>"`, then `fo verify <ID>`.
 
 **Review.** For a task in REVIEWING, read the diff (the verify output names the checkout) and the evidence, and work through the review questions in `${CLAUDE_SKILL_DIR}/references/verification-policy.md`. Then record the verdict:
@@ -110,6 +112,7 @@ FO_EOF
 node "${CLAUDE_SKILL_DIR}/scripts/fo.cjs" review <ID> --integrate --stdin <<'FO_EOF'
 task_id: <ID>
 reviewer: orchestrator
+candidate_commit: <full commit from verification, for Git tasks>
 verdict: approve
 criteria:
   - met: true
@@ -118,7 +121,7 @@ findings: []
 FO_EOF
 ```
 
-One `criteria` entry per acceptance criterion, in order. Approve only what you checked. When `fo` asks for an independent review first, `fo review-package <ID>` prints the reviewer's Agent call; pass the reviewer's YAML to `fo review <ID> --stdin`, then record your own. `--integrate` merges approved work into the run's integration branch, re-runs the checks on the merged result and completes the task, which releases its dependents.
+One `criteria` entry per acceptance criterion, in order. Approve only what you checked. When `fo` asks for an independent review first, `fo review-package <ID>` prints the reviewer's Agent call; pass the reviewer's YAML to `fo review <ID> --agent-id <reviewer's host ID> --stdin`, then record your own. `--integrate` merges approved work into the run's integration branch, re-runs the checks on the merged result and completes the task, which releases its dependents.
 
 **Correct.** For CORRECTION_REQUIRED, write a targeted correction: the specific failure, the evidence, the expected behaviour, the one change required, and how it will be re-verified. Shape: `${CLAUDE_SKILL_DIR}/templates/correction-request.yaml`.
 
@@ -147,16 +150,16 @@ In your closing message, lead with the outcome per task taken from the final rep
 - Only COMPLETED counts as done. Blocked, failed and unverified work is reported as exactly that.
 - Limits on retries, correction rounds and the budget are raised only by the user. Ask, then record the answer: `fo authorize ... --by user --reason "..."`.
 - A cancelled task stays cancelled; stop its agent if it is still running.
-- Work with external side effects (deployments, sends, purchases, migrations on shared systems) is marked `side_effects: external` in its contract. `fo` will not dispatch it without recorded user authorization and never retries it.
+- Work with external side effects (deployments, sends, purchases, migrations on shared systems) is marked `side_effects: external` in its contract. `fo` defers it because the CLI cannot authenticate the host permission decision. Use a separately authorized host action.
 - No git command that discards or publishes work: no `reset --hard`, `checkout --`, `clean`, forced operations, or `push`.
 - The session's permission mode stands. A worker reporting a denied tool is a `permission` failure to surface to the user.
 
 ## When things differ
 
 - **Agent type not registered.** `fo next` prints the fallback: `general-purpose` plus the role file.
-- **No git, or a shared workspace.** `init` says so. The loop is the same; tasks with overlapping scopes run one at a time and changes land in place.
+- **No git, or a shared workspace.** `init` says so. The loop is the same; tasks with tasks run one at a time and changes land in place.
 - **Doing a task yourself.** Only when delegating would cost more than the work, when worker attempts failed and you escalated (`fo escalate <ID> --kind strategy --role orchestrator --reason "..."`), or when integration needs your global view. `fo` gives you a workspace; you still report, verify, and get an independent review, because your own work is never self-approved.
-- **Interrupted, or context was compacted.** `fo resume` prints the request, decisions, states and open actions. The checkpoint on disk outranks your memory of the run.
+- **Interrupted, or context was compacted.** `fo resume` prints the request, decisions, states and open actions. It retains active dispatches while their liveness is unknown. Record a failure only after the host confirms the attempt ended. Use `fo reconcile` after an interrupted CLI operation once the process and its checkout have been checked.
 - **Budget limit reached.** Stop dispatching and ask the user.
 - **`fo` reports recovered state.** Follow the `fo recover` output before continuing.
 - **A worker's task was larger than specified** (`needs_decomposition`). Plan the proposed pieces as new contracts, then cancel or amend the parent.

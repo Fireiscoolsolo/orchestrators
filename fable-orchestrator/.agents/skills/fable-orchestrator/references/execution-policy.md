@@ -37,21 +37,21 @@ Scope overlap is judged conservatively: a directory overlaps everything under it
 |---|---|---|
 | `native` | default in a git repository with at least one commit | the Agent call carries `isolation: worktree`; Claude Code gives the worker its own worktree and branch |
 | `managed` | `isolation.strategy: managed`, and always for tasks the orchestrator implements | `fo` creates the worktree and branch and the prompt names the directory |
-| `shared` | no git, no commits, or configured | no isolation; overlapping scopes are serialized; changes land in place |
+| `shared` | no git, no commits, or configured | no isolation; tasks are serialized; changes land in place |
 
 In git workspaces:
 
 1. At the first dispatch `fo` creates branch `fable/<run>/integration` in a worktree of its own, from your current HEAD. Your checkout is not touched during the run.
 2. Each task prompt starts with `git merge --no-edit <commit>` for the integration tip (and the previous attempt, on a correction). Claude Code branches agent worktrees from the default branch, so this step is what guarantees a dependent task sees its dependencies' integrated work.
 3. The worker commits on its own branch and reports the commit. If it leaves changes uncommitted, `fo` commits them on that branch so that what was verified is what gets merged.
-4. Verification runs in the worker's worktree, or in a detached checkout of the reported commit if that worktree is gone.
+4. Verification uses a fresh detached checkout of the commit accepted for the assigned worktree.
 5. `fo integrate` merges the commit into the integration worktree with `--no-commit`, runs the integration commands on the merged tree, then commits the merge or aborts it. A conflict or a failed check leaves the integration branch exactly as it was.
 6. `fo deliver` fast-forwards your branch to the integration branch. Git refuses a fast-forward that would overwrite local modifications, and `fo` never forces it: when it cannot deliver it reports the branch name and stops.
 7. `fo cleanup` removes checkouts `fo` created, removes worker worktrees only when they are clean, and deletes only branches that are merged.
 
 Uncommitted changes in your checkout stay where they are. They are not visible to workers; `fo` warns when they fall inside a task's scope.
 
-In the shared workspace `fo` fingerprints the tree at dispatch and again at report, attributes changed files to the task whose scope contains them, and treats a changed file that belongs to no in-flight task as a scope violation.
+In a shared workspace `fo` compares content fingerprints between dispatch and report. An incomplete snapshot prevents approval through that report. Changes happen in place.
 
 ## Budget
 

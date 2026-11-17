@@ -52,6 +52,7 @@ const DANGEROUS = [
 ];
 
 function dangerousCommand(cmd) {
+  if (typeof cmd !== 'string' || !cmd.trim() || cmd.includes('\0')) return 'expected a nonempty command without NUL bytes';
   for (const [re, why] of DANGEROUS) if (re.test(cmd)) return why;
   return null;
 }
@@ -199,7 +200,7 @@ function validateReport(raw, task, opts) {
   r.findings = strList(raw.findings, 'findings', errors);
   r.reason = text(raw.reason);
   r.commit = text(raw.commit);
-  if (r.commit && !/^[0-9a-f]{7,40}$/i.test(r.commit)) errors.push('commit: must be a git commit SHA');
+  if (r.commit && !/^[0-9a-f]{7,64}$/i.test(r.commit)) errors.push('commit: must be a git commit SHA');
   r.branch = text(raw.branch);
   r.worktree_path = text(raw.worktree_path);
   r.delegations = Number.isInteger(raw.delegations) && raw.delegations > 0 ? raw.delegations : 0;

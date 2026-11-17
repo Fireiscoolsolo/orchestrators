@@ -27,7 +27,7 @@ For every project on this machine:
 node .claude/skills/fable-orchestrator/scripts/install.cjs --user
 ```
 
-The installer never replaces an agent file it does not manage unless you pass `--force`. `--dry-run` shows what it would do; `--uninstall` removes what it installed. If it created `.claude/skills` or `.claude/agents` for the first time, restart Claude Code so they are picked up.
+The installer uses namespaced agent names and records ownership in `.claude/.fable-orchestrator-install.json`. It preserves edited and unrelated files. `--force` can adopt an exact match only. Use `--dry-run` to preview changes and `--uninstall` to remove files that still match the manifest. Restart Claude Code if it discovers these directories for the first time.
 
 Check an installation:
 
@@ -56,9 +56,9 @@ What happens in a run:
 
 1. **Intake.** The orchestrator reads the project, separates your objectives, and records assumptions. It asks you only about things that change correctness, security, destructive or external actions, or spending.
 2. **Plan.** One contract per task: objective, acceptance criteria, file scope, verification commands, dependencies, complexity. `fo plan` validates them, builds the dependency graph and routes each task to a role and model.
-3. **Execute.** Independent tasks whose file scopes do not overlap run in parallel, each in its own git worktree. `fo` runs the verification commands itself, checks the changed files against the scope, and the orchestrator reviews the diff against every criterion.
+3. **Execute.** Independent tasks whose file scopes do not overlap run in parallel, each in its own git worktree. `fo` runs task checks in a fresh checkout of the candidate commit, checks scope, and records the commit and tree. The orchestrator reviews that candidate against each criterion.
 4. **Correct.** A failed check or a rejected review produces a targeted correction for a fresh worker. Rounds are bounded.
-5. **Integrate and deliver.** Approved work is merged into a run-specific integration branch and re-checked there. At the end your branch is fast-forwarded to it. Nothing is forced, and your uncommitted changes are left alone.
+5. **Integrate and deliver.** Approved work is merged and checked in a detached checkout before the integration branch advances. Delivery verifies the pinned integration commit again and fast-forwards to that commit. Nothing is forced, and your uncommitted changes are left alone.
 6. **Report.** `fo final-report` is generated from recorded state and evidence files: what completed, what did not, and why.
 
 ## Headless use
@@ -108,9 +108,9 @@ node --test .claude/skills/fable-orchestrator/scripts/tests/
 
 - Dollar cost and the orchestrator's own token usage are not visible from inside a session. `fo` counts agent dispatches and records worker token counts when they are passed to it; it prints no cost figure.
 - Context usage cannot be read and compaction cannot be triggered by a running model. The on-disk checkpoint and `--resume` are the substitute.
-- `fo` executes verification commands itself so exit codes cannot be misreported. Claude Code's per-command permission rules therefore see `node ... fo.cjs`, not the individual commands. Commands come only from the plan you can inspect with `--plan-only`, and destructive ones are refused. See `references/verification-policy.md`.
+- `fo` executes verification commands itself so exit codes cannot be misreported. Claude Code's per-command permission rules therefore see `node ... fo.cjs`, not the individual commands. Review setup, verification, and regression commands before execution. Screening is advisory and command execution inherits the host's filesystem and network access. See `references/verification-policy.md`.
 - Hooks from other plugins apply to the orchestrator and to every worker. A hook that rejects the first shell command or the first write to a new file costs each worker an extra turn.
-- Agent worktrees start from the repository's default branch. The task prompt makes each worker merge the run's integration branch first; a worker that skips that step is caught at integration, not before.
+- Agent worktrees start from the repository's default branch. The task prompt makes each worker merge the run's integration branch first; a report whose commit omits an assigned starting commit is rejected.
 - Agent teams are not used: they are experimental, off by default, and unavailable in headless mode.
 - Quality of decomposition, contracts and reviews depends on the orchestrator model. Run the skill on your most capable model.
 - The YAML parser handles the subset the contracts need (mappings, lists, lists of mappings, quoted and block scalars, single-line flow collections), not anchors, tags or multi-line flow collections.

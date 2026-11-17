@@ -25,11 +25,11 @@ Put the commands in the contract's `verification_commands`. Prefer the narrowest
 
 ## What `fo verify` does
 
-1. Runs each `verification_commands` entry in the worker's checkout (or a detached checkout of the reported commit), under bash where available, with the configured timeout. Output and exit code go to `evidence/<ID>-c<cycle>-v<n>.log`.
+1. Runs `verification_commands` in a fresh detached checkout of the accepted candidate commit for Git tasks, under bash where available, with the configured timeout. Output and exit code go to `evidence/<ID>-c<cycle>-v<n>.log`.
 2. Compares the files actually changed (from git, or from the tree fingerprint in a shared workspace) with the contract's `file_scope`. A file outside the scope is a failed check.
 3. Decides: every check passed and at least one command or manual check exists gives REVIEWING; any failure gives CORRECTION_REQUIRED; nothing verifiable is an error that leaves the task in VERIFYING until a check is recorded or the task is blocked as unverified.
 
-`fo integrate` repeats the task's commands on the merged tree. A task that passed alone and fails merged goes to CORRECTION_REQUIRED and the merge is aborted.
+`fo integrate` repeats the task's commands on the merged tree. If the detached merged candidate fails, the task returns to CORRECTION_REQUIRED and the integration branch stays at its previous commit.
 
 A task that cannot be verified stays incomplete: `fo block <ID> --kind unverified --reason "..."`, and the final report lists it under "Not completed".
 
@@ -37,8 +37,8 @@ A task that cannot be verified stays incomplete: `fo block <ID> --kind unverifie
 
 `fo` executes verification commands itself so that their exit codes cannot be misreported. That has a consequence you should know: the commands run inside the `node ... fo.cjs` process, so Claude Code's per-command permission rules see `node`, not the commands. To keep that honest:
 
-- commands come only from contracts (shown in the plan; use `--plan-only` to inspect them first), from `integration.regression_command`, and from explicit `--cmd` arguments;
-- `fo` refuses commands that delete recursively, rewrite or publish git history, deploy, publish packages, change infrastructure, pipe downloads into a shell, or run destructive SQL, both at planning time and when asked to run them;
+- commands come only from contracts (shown in the plan; use `--plan-only` to inspect them first), from `integration.regression_command`, from the setup command, and from explicit `--cmd` arguments;
+- screening refuses some destructive and external command patterns. Use host isolation to enforce permissions on all child processes;
 - the skill requests no pre-approved tools, so whether `node ... fo.cjs` needs your approval is decided by your own permission settings.
 
 ## The review questions

@@ -87,7 +87,7 @@ any active state -> BLOCKED | FAILED | CANCELLED
 | Transition | Happens when | Guard |
 |---|---|---|
 | PENDING -> READY | `fo` refreshes after any completion | every dependency is COMPLETED |
-| READY -> DISPATCHED | `fo next` | dependencies complete, no file-scope conflict with work in flight, a free worker slot, budget left, user authorization recorded for external side effects |
+| READY -> DISPATCHED | `fo next` | dependencies complete, no file-scope conflict with work in flight, a free worker slot, budget left, no external side effects requiring a host-authorized action |
 | DISPATCHED -> RUNNING | `fo started` | none |
 | RUNNING -> IMPLEMENTED | `fo report` | a valid completion report with status implemented; in git workspaces the commit must be locatable |
 | IMPLEMENTED -> VERIFYING | `fo verify`, `fo check` | none |
@@ -99,7 +99,7 @@ any active state -> BLOCKED | FAILED | CANCELLED
 | APPROVED -> INTEGRATING | `fo integrate` | no other task is integrating |
 | INTEGRATING -> COMPLETED | `fo integrate` | merge without conflict and every integration command passed |
 | INTEGRATING -> CORRECTION_REQUIRED | `fo integrate` | conflict (merge aborted) or a failed integration command |
-| RUNNING -> READY | `fo worker-failed`, `fo resume` | retries used are below the limit; never for tasks with external side effects |
+| RUNNING -> READY | `fo worker-failed` | the attempt has ended and retries used are below the limit; never for tasks with external side effects |
 | any -> BLOCKED | worker reports blocked, limits reached, `fo block` | none; the reason and the state it came from are recorded |
 | BLOCKED -> earlier state | `fo unblock`, `fo escalate` | an explicit reason |
 | FAILED -> READY | `fo escalate` | an explicit reason and a change of model, decomposition, context or strategy |

@@ -31,3 +31,6 @@ validation/
 **/*.key
 **/*.pem
 **/*.pfx
+**/.claude/.fable-orchestrator-install.json
+**/.claude/.fable-orchestrator-install.lock
+**/.claude/agents/

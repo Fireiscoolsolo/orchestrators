@@ -4,6 +4,7 @@
 # never takes tests_passed on trust.
 
 task_id: AUTH-001
+attempt_id: 00000000-0000-4000-8000-000000000001 # example; copy the ID from the dispatch
 status: implemented               # implemented | blocked | failed | needs_decomposition
 summary: Added refreshAccessToken() and wired it into the session middleware.
 files_changed:

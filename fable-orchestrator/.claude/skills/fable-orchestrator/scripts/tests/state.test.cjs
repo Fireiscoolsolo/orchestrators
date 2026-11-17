@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { spawn, spawnSync } = require('child_process');
 const sm = require('../state_manager.cjs');
 const V = require('../validate.cjs');
 const R = require('../routing.cjs');
@@ -301,6 +302,8 @@ test('recovery: corrupted state falls back to the backup, then to a snapshot, an
   store.transact(() => {});
   assert.ok(store.recovered.lost_events.length >= 1, 'events newer than the backup are listed for reconciliation');
   assert.ok(fs.readdirSync(dir).some((f) => f.startsWith('state.json.corrupt-')), 'the unreadable file is preserved as evidence');
+  const sequences = readEvents(store).map((e) => e.seq);
+  assert.deepEqual(sequences, [...new Set(sequences)].sort((a, b) => a - b));
   store.read();
   assert.equal(store.recovered, null, 'state.json is valid again');
 
@@ -315,16 +318,199 @@ test('recovery: corrupted state falls back to the backup, then to a snapshot, an
   assert.throws(() => store.read(), (e) => e.code === 'STATE_UNRECOVERABLE' && e.exit === 1);
 });
 
-test('locking: a stale lock is taken over, a live one is released after use', () => {
+const storeScript = `
+  const fs = require('fs');
+  const sm = require(process.argv[1]);
+  const store = new sm.Store(process.argv[2]);
+`;
+const stateModule = require.resolve('../state_manager.cjs');
+
+function exitDuring(dir, script, code) {
+  const result = spawnSync(process.execPath, ['-e', storeScript + script, stateModule, dir], { encoding: 'utf8', timeout: 10000 });
+  assert.ifError(result.error);
+  assert.equal(result.status, code, result.stderr);
+}
+
+function startWriter(dir, script, onMessage) {
+  const child = spawn(process.execPath, ['-e', storeScript + script, stateModule, dir], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+  let stderr = '';
+  const done = new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.once('close', (code, signal) => {
+      if (code === 0) resolve();
+      else reject(new Error(`writer exited ${code ?? signal}: ${stderr}`));
+    });
+  });
+  if (onMessage) child.once('message', onMessage);
+  return { child, done };
+}
+
+function readEvents(store) {
+  return fs.readFileSync(store.eventsPath, 'utf8').trimEnd().split('\n').map((line) => JSON.parse(line));
+}
+
+test('locking: legacy or live ownership records are never reclaimed based on age', () => {
   const dir = tmp();
   const store = new sm.Store(dir);
+  const contender = new sm.Store(dir);
   store.create(mkState([contract('A-1')]));
   fs.writeFileSync(store.lockPath, 'dead-process');
   const old = new Date(Date.now() - 60000);
   fs.utimesSync(store.lockPath, old, old);
-  store.transact((s) => { s.decisions.push({ at: sm.nowIso(), text: 'after stale lock' }); });
-  assert.equal(store.read().decisions.length, 1);
+  assert.throws(() => contender.lock(0), code('LOCK_TIMEOUT'));
+  assert.equal(fs.readFileSync(store.lockPath, 'utf8'), 'dead-process');
+  fs.unlinkSync(store.lockPath);
+
+  store.lock();
+  fs.utimesSync(store.lockPath, old, old);
+  try {
+    assert.throws(() => contender.lock(0), code('LOCK_TIMEOUT'));
+    assert.equal(contender.unlock(), false, 'a contender cannot release a live owner lock');
+    assert.ok(fs.existsSync(store.lockPath));
+  } finally {
+    assert.equal(store.unlock(), true);
+  }
   assert.ok(!fs.existsSync(store.lockPath));
+});
+
+test('locking: a release never removes a replacement owner record', () => {
+  const dir = tmp();
+  const owner = new sm.Store(dir);
+  const replacement = new sm.Store(dir);
+  owner.lock();
+  fs.unlinkSync(owner.lockPath);
+  replacement.lock();
+  try {
+    assert.equal(owner.unlock(), false);
+    assert.ok(fs.existsSync(replacement.lockPath));
+  } finally {
+    assert.equal(replacement.unlock(), true);
+  }
+});
+
+test('locking: concurrent writers recover a terminated owner and serialize long transactions', { timeout: 15000 }, async () => {
+  const dir = tmp();
+  const store = new sm.Store(dir);
+  store.create(mkState([contract('A-1')]));
+  exitDuring(dir, 'store.lock(); process.exit(23);', 23);
+  const record = JSON.parse(fs.readFileSync(store.lockPath, 'utf8'));
+  assert.notEqual(record.pid, process.pid);
+
+  const writers = [];
+  const start = (script, onMessage) => {
+    const writer = startWriter(dir, script, onMessage);
+    writers.push(writer);
+    return writer.done;
+  };
+  let second;
+  try {
+    const first = start(`
+      store.transact((state) => {
+        process.send('locked');
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400);
+        state.decisions.push({ text: 'first' });
+        sm.emit(state, { type: 'decision', text: 'first' });
+      });
+    `, () => {
+      second = start(`
+        store.transact((state) => {
+          state.decisions.push({ text: 'second' });
+          sm.emit(state, { type: 'decision', text: 'second' });
+        });
+      `);
+      // Attach a rejection handler while the first writer is still running.
+      second.catch(() => {});
+    });
+    await first;
+    assert.ok(second, 'first writer reported lock acquisition');
+    await second;
+    assert.deepEqual(store.read().decisions.map((d) => d.text), ['first', 'second']);
+    assert.deepEqual(readEvents(store).filter((e) => e.type === 'decision').map((e) => e.text), ['first', 'second']);
+    assert.ok(!fs.existsSync(store.lockPath));
+  } finally {
+    for (const { child } of writers) {
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+    }
+  }
+});
+
+test('persistence: interruption before atomic replacement keeps the last committed state', () => {
+  const dir = tmp();
+  const store = new sm.Store(dir);
+  store.create(mkState([contract('A-1')]));
+  const before = fs.readFileSync(store.statePath, 'utf8');
+  exitDuring(dir, `
+    const rename = fs.renameSync;
+    fs.renameSync = (from, to) => {
+      if (to === store.statePath) process.exit(24);
+      rename(from, to);
+    };
+    store.transact((state) => {
+      state.decisions.push({ text: 'uncommitted' });
+      sm.emit(state, { type: 'uncommitted' });
+    });
+  `, 24);
+  assert.equal(fs.readFileSync(store.statePath, 'utf8'), before);
+  store.transact((state) => { state.decisions.push({ text: 'committed' }); });
+  assert.deepEqual(store.read().decisions.map((d) => d.text), ['committed']);
+  assert.ok(!readEvents(store).some((e) => e.type === 'uncommitted'));
+});
+
+test('persistence: a partially appended UTF-8 event is replayed once after interruption', () => {
+  const dir = tmp();
+  const store = new sm.Store(dir);
+  store.create(mkState([contract('A-1')]));
+  exitDuring(dir, `
+    const flush = store.flushEvents.bind(store);
+    store.flushEvents = (state) => {
+      if (!state.event_batch?.text.includes('interrupted_batch')) return flush(state);
+      const bytes = Buffer.from(state.event_batch.text);
+      fs.appendFileSync(store.eventsPath, bytes.subarray(0, bytes.indexOf(Buffer.from('é')) + 1));
+      process.exit(25);
+    };
+    store.transact((state) => {
+      state.decisions.push({ text: 'committed before interruption' });
+      sm.emit(state, { type: 'interrupted_batch', note: 'café' });
+      sm.emit(state, { type: 'also_committed' });
+    });
+  `, 25);
+  assert.deepEqual(store.read().decisions.map((d) => d.text), ['committed before interruption']);
+  store.transact(() => {});
+  store.transact(() => {});
+  const events = readEvents(store);
+  assert.deepEqual(events.filter((e) => e.type === 'interrupted_batch').map((e) => e.note), ['café']);
+  assert.equal(events.filter((e) => e.type === 'also_committed').length, 1);
+});
+
+test('persistence: divergent event data stops a writer instead of accepting a new transaction', () => {
+  const store = new sm.Store(tmp());
+  store.create(mkState([contract('A-1')]));
+  const before = fs.readFileSync(store.statePath, 'utf8');
+  const log = fs.readFileSync(store.eventsPath, 'utf8').replace('run_created', 'run_unknown');
+  fs.writeFileSync(store.eventsPath, log);
+  assert.throws(() => store.transact(() => assert.fail('callback must not run')), code('EVENT_LOG_DIVERGED'));
+  assert.equal(fs.readFileSync(store.statePath, 'utf8'), before);
+  assert.equal(fs.readFileSync(store.eventsPath, 'utf8'), log);
+  assert.ok(!fs.existsSync(store.lockPath));
+});
+
+test('persistence: log write failures distinguish a committed update from a failed transaction', () => {
+  const store = new sm.Store(tmp());
+  store.create(mkState([contract('A-1')]));
+  const flush = store.flushEvents.bind(store);
+  store.flushEvents = (state) => {
+    if (state.event_batch?.text.includes('committed_update')) throw new Error('log write failed');
+    flush(state);
+  };
+  assert.throws(() => store.transact((state) => {
+    state.decisions.push({ text: 'recorded' });
+    sm.emit(state, { type: 'committed_update' });
+  }), code('STATE_COMMITTED_LOG_PENDING'));
+  assert.deepEqual(store.read().decisions.map((d) => d.text), ['recorded']);
+  store.flushEvents = flush;
+  store.transact(() => {});
+  assert.equal(readEvents(store).filter((e) => e.type === 'committed_update').length, 1);
 });
 
 test('views: next actions, summary states and the final report reflect recorded state only', () => {

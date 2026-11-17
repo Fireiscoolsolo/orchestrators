@@ -3,6 +3,8 @@
 # An approve verdict is refused unless every acceptance criterion is met WITH evidence.
 
 task_id: AUTH-001
+candidate_commit: 3f9c2e1a7b4d5c6e8f0a1b2c3d4e5f6a7b8c9d0e  # use the verified commit for Git tasks
+# Independent reviewers also copy attempt_id and review_dispatch_id from the review package.
 reviewer: orchestrator            # orchestrator | review-worker
 perspective: correctness          # correctness | security (independent reviews)
 verdict: approve                  # approve | reject
