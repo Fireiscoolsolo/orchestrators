@@ -1,0 +1,31 @@
+# Review report - recorded with: fo review <TASK-ID> --file <this file> [--integrate]
+# Accepted only while the task is REVIEWING, which it reaches only after verification passed.
+# An approve verdict is refused unless every acceptance criterion is met WITH evidence.
+
+task_id: AUTH-001
+reviewer: orchestrator            # orchestrator | review-worker
+perspective: correctness          # correctness | security (independent reviews)
+verdict: approve                  # approve | reject
+criteria:                         # one entry per acceptance criterion, in contract order
+  - met: true
+    evidence: tests/auth/token.test.ts "refreshes an expired token" passes (evidence/AUTH-001-c1-v1.log)
+  - met: true
+    evidence: token.ts:58 returns 401 for a revoked refresh token; covered by the "rejects revoked token" test
+  - met: true
+    evidence: npm test -- tests/auth exited 0 with 41 tests passing
+findings: []                      # required when rejecting: each defect, where it is, why it matters
+
+# The ten review questions. Optional, except for oversight-tier tasks (complexity 9-10),
+# where the orchestrator must answer all of them. Any false blocks approval.
+checks:
+  criteria_met: true
+  no_functional_defects: true
+  no_regressions: true
+  no_unauthorized_files: true
+  tests_meaningful: true
+  error_cases_handled: true
+  security_boundaries_preserved: true
+  maintainable: true
+  documentation_accurate: true
+  evidence_sufficient: true
+notes: Diff read in full; the tests fail when the expiry check is removed.

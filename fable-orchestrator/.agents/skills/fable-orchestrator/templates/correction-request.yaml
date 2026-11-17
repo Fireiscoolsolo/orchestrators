@@ -1,0 +1,27 @@
+# Targeted correction request - recorded with: fo correct <TASK-ID> --file <this file>
+# Name the one thing that is wrong and the one change that fixes it. Never ask for a rewrite
+# when a local fix is enough.
+
+task_id: AUTH-001
+failure: A revoked refresh token is still accepted.
+evidence: evidence/AUTH-001-c1-v1.log - "rejects revoked token" expected 401, received 200
+expected_behavior: Requests carrying a revoked refresh token are rejected with HTTP 401.
+required_change: In src/auth/token.ts refreshAccessToken(), check the revocation list before issuing a new access token.
+verification:
+  - npm test -- tests/auth
+scope:                            # optional: narrow the worker to these paths (must lie inside the task file_scope)
+  - src/auth/token.ts
+
+# Widening the scope is a specification change and needs a reason:
+# scope_expansion:
+#   - src/auth/revocation.ts
+# scope_expansion_reason: The revocation list lives outside the original scope.
+
+# Optional: hand the correction to a different role.
+# assign_role: debug-worker
+
+# Required from the second round on. A repeated correction has to change something.
+# strategy_change:
+#   kind: model                   # model | decomposition | context | strategy
+#   detail: Two attempts on sonnet missed the revocation path; escalating one tier.
+#   model: opus                   # optional with kind model; omitted = next tier up

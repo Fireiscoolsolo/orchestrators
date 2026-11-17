@@ -1,0 +1,33 @@
+# Orchestrator runtime and inbox data
+**/.claude/fable-orchestrator/
+**/.[Cc]odex/fable-orchestrator/
+**/.fable-inbox/
+**/.claude/worktrees/
+**/.codex/worktrees/
+.worktrees/
+worktrees/
+
+# Local host settings and session data
+**/.claude/settings.local.json
+**/.claude/history.jsonl
+**/.codex/auth.json
+**/.codex/config.toml
+**/.codex/history.jsonl
+**/.codex/sessions/
+**/.codex/archived_sessions/
+**/.codex/log/
+**/.codex/logs/
+
+# Private validation artifacts and temporary output
+validation/
+**/raw-session-logs/
+**/*.log
+**/*.jsonl
+**/node_modules/
+
+# Local credentials
+**/.env
+**/.env.*
+**/*.key
+**/*.pem
+**/*.pfx

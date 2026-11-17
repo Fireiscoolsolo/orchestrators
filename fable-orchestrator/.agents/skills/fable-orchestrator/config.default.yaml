@@ -1,0 +1,48 @@
+# fable-orchestrator defaults.
+# Override per project in .claude/fable-orchestrator/config.yaml (same keys; only what you change).
+# Invocation flags (--mode, --max-workers, --review-rounds) override both.
+
+execution:
+  mode: balanced            # fast | balanced | thorough | maximum
+  max_workers: 5            # upper bound; the scheduler dispatches only what is ready and conflict-free
+  max_review_rounds: 3      # correction rounds per task before the user is asked
+  max_task_retries: 2       # re-dispatches after a crash or unusable worker output
+
+budget:
+  enabled: true
+  token_limit: null         # reported worker tokens; null = no limit set by you (account limits still apply)
+  cost_limit_usd: null      # not enforceable in-session; use `claude -p --max-budget-usd` for headless runs
+  agent_call_limit: null    # hard cap on worker dispatches; the reliable in-session control
+  warn_at_percent: 80
+
+routing:
+  adaptive: true
+  prefer_lower_cost_models: true
+  allow_escalation: true
+  min_samples: 5            # observed tasks per tier before outcome data may adjust routing
+  min_first_pass_rate: 0.5
+  tiers:                    # complexity band -> model alias and effort for the Agent call
+    light: {model: haiku, effort: null}            # complexity 1-2
+    standard: {model: sonnet, effort: medium}      # complexity 3-4
+    capable: {model: sonnet, effort: high}         # complexity 5-6
+    lead: {model: opus, effort: high}              # complexity 7-8, opus-executor
+    lead_oversight: {model: opus, effort: xhigh}   # complexity 9-10, opus-executor with full orchestrator review
+  # Relative cost units used only to compare tiers. Seeded from Anthropic list input prices
+  # per million tokens as cached on 2026-11-03; adjust if pricing changes.
+  cost_weights: {haiku: 0.1, sonnet: 2, opus: 4, fable: 8}
+
+isolation:
+  strategy: auto            # auto | native | managed | shared
+                            # native: Agent tool isolation "worktree"; managed: fo creates the worktree;
+                            # shared: no git isolation (used automatically outside a git repository)
+
+integration:
+  auto_deliver: true        # fast-forward your branch to the integrated result at the end (never forced)
+  regression_command: null  # project-wide test command, e.g. "npm test"; run at integration per mode policy
+  setup_command: null       # run once in fresh checkouts, e.g. "npm ci"
+
+verification:
+  command_timeout_seconds: 600
+
+learning:
+  enabled: true             # record routing outcomes and observations; proposals are never applied automatically

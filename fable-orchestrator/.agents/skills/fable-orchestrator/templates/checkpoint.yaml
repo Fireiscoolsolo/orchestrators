@@ -1,0 +1,39 @@
+# Shape of <run_dir>/checkpoint.yaml. fo rewrites it after every state change; do not edit it.
+# It is the compact summary to re-read after an interruption or a context compaction
+# (`fo resume` prints the same information plus the open actions).
+
+run_id: 20261113-201500-a1b2
+updated_at: "2026-11-13T20:31:07.412Z"
+phase: EXECUTING                  # INTAKE | PLANNED | EXECUTING | DELIVERED
+run_state: IN_PROGRESS            # INTAKE | IN_PROGRESS | STALLED | COMPLETE | COMPLETE_WITH_FAILURES
+request: Fix the login system, add integration tests, and update the docs.
+options:
+  mode: balanced
+  max_workers: 5
+  max_review_rounds: 3
+  max_task_retries: 2
+  plan_only: false
+workspace: native                 # native | managed | shared
+decisions:
+  - Assumed the session cookie name stays unchanged (not stated in the request).
+tasks:
+  - id: AUTH-001
+    title: Implement token refresh handling
+    state: REVIEWING
+    dependencies: []
+    assignment: implementation-worker on sonnet (capable)
+    dispatches: 2
+    correction_rounds: 1
+    retries: 0
+    commit: 3f9c2e1a7b4d5c6e8f0a1b2c3d4e5f6a7b8c9d0e
+    last_event: "VERIFYING -> REVIEWING: 2 check(s) passed"
+    pending_correction: null
+    blocked: null
+integration:
+  branch: fable/20261113-201500-a1b2/integration
+  delivery: pending
+budget:
+  agent_calls: 3
+  tokens_reported: 0
+next_actions:
+  - "AUTH-001: REVIEWING - needs the orchestrator review; `fo review AUTH-001 --file <review.yaml> --integrate`"

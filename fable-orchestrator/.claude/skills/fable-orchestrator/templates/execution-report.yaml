@@ -1,0 +1,37 @@
+# Worker completion report - the last thing a worker returns, as one fenced yaml block.
+# Ingest with: fo report <TASK-ID> --file <saved report> --verify
+# Every value must be what the worker observed. fo re-runs verification itself and
+# never takes tests_passed on trust.
+
+task_id: AUTH-001
+status: implemented               # implemented | blocked | failed | needs_decomposition
+summary: Added refreshAccessToken() and wired it into the session middleware.
+files_changed:
+  - src/auth/token.ts
+  - tests/auth/token.test.ts
+verification:
+  tests_run: true
+  tests_passed: true
+  build_passed: null              # true | false | null when not applicable
+  commands:
+    - cmd: npm test -- tests/auth
+      exit_code: 0
+known_issues: []
+commit: 3f9c2e1a7b4d5c6e8f0a1b2c3d4e5f6a7b8c9d0e    # git workspaces: git rev-parse HEAD
+branch: worktree-auth-001                            # git branch --show-current
+worktree_path: /path/to/worktree                     # git rev-parse --show-toplevel
+
+# Only when status is blocked or failed:
+# reason: The refresh endpoint needs a secret that is not available in this environment.
+
+# Research and review roles report findings instead of files_changed:
+# findings:
+#   - src/auth/session.ts:42 reads the token without checking expiry
+
+# An execution lead that delegated sub-steps reports how many agent calls it made:
+# delegations: 2
+
+# status needs_decomposition may carry proposed contracts for the orchestrator to register:
+# proposed_subtasks:
+#   - task_id: AUTH-002
+#     title: Split out token storage

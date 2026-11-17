@@ -1,0 +1,47 @@
+# Task contract - one file per task, saved as <run_dir>/tasks/<TASK-ID>.yaml
+# `fo plan` validates every contract, builds the dependency graph and routes each task.
+# status and review_round are owned by the state machine: leave them out.
+
+task_id: AUTH-001                 # PREFIX-NNN, unique within the run
+title: Implement token refresh handling
+objective: Expired access tokens are refreshed transparently and invalid refresh tokens are rejected.
+priority: high                    # low | medium | high | critical
+dependencies:                     # task ids that must be COMPLETED before this one is dispatched
+  - AUTH-000
+
+# Complexity: give complexity_score (1-10) directly, or score the eight factors 0-3 and let fo compute it.
+complexity_factors:
+  components: 2                   # how many components are touched
+  architecture: 1                 # architectural complexity
+  ambiguity: 1                    # how much of the requirement is open to interpretation
+  dependencies: 1                 # dependency complexity
+  uncertainty: 1                  # technical unknowns
+  regression_risk: 2
+  security: 2                     # 2 or 3 marks the task security-sensitive
+  debugging: 1                    # expected debugging difficulty
+risk_level: medium                # low | medium | high
+
+assigned_role: auto               # auto, or a role: implementation-worker, research-worker, test-worker, review-worker, debug-worker, integration-worker, documentation-worker, opus-executor, orchestrator
+preferred_model: auto             # auto | haiku | sonnet | opus | fable - a floor; it never lowers the routed tier
+security_sensitive: true
+side_effects: none                # none | local | external - external needs recorded user authorization before dispatch
+exclusive: false                  # true = run alone, with no other task in flight
+
+file_scope:                       # files, directories (trailing slash) or globs the worker may create or modify
+  - src/auth/
+  - tests/auth/
+inputs:
+  - Existing session middleware in src/auth/session.ts
+outputs:
+  - refreshAccessToken() exported from src/auth/token.ts
+
+acceptance_criteria:              # observable, testable statements - the review answers each one with evidence
+  - A request with an expired access token and a valid refresh token succeeds and returns a new access token
+  - A request with an invalid or revoked refresh token is rejected with HTTP 401
+  - The existing authentication tests still pass
+verification:                     # what the worker does before reporting
+  - Add tests for the expired-token and invalid-refresh-token paths
+  - Run the authentication unit tests
+verification_commands:            # fo runs these itself afterwards; exit code 0 means pass
+  - npm test -- tests/auth
+context: Tokens are JWTs signed with the key in config/keys. Do not change the signing scheme.
