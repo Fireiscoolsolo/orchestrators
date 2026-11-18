@@ -101,7 +101,8 @@ function reviewFile(repo, scratch, id, n, verdict) {
   const approve = verdict !== 'reject';
   const file = path.join(scratch, `${id}.review.${Date.now()}.yaml`);
   fs.writeFileSync(file, yaml.dump({
-    task_id: id, reviewer: 'orchestrator', candidate_commit: currentTask(repo, id).verified_candidate?.commit, verdict: approve ? 'approve' : 'reject',
+    task_id: id, reviewer: 'orchestrator', candidate_commit: currentTask(repo, id).verified_candidate?.commit,
+    candidate_snapshot: currentTask(repo, id).verified_snapshot_id, verdict: approve ? 'approve' : 'reject',
     criteria: Array.from({ length: n }, () => ({ met: approve, evidence: 'check output and diff inspected' })),
     findings: approve ? [] : ['the behaviour does not match the criterion'],
   }));

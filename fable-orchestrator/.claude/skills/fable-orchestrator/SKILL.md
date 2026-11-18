@@ -104,13 +104,14 @@ Before ingesting a native-worktree report, bind the dispatch using only the host
 - The worker crashed, returned nothing usable, or hit a permission or rate limit: `fo worker-failed <ID> --attempt-id <dispatch UUID> --kind crash|invalid_output|permission|rate_limit|context|missing_tool|unsupported_model|timeout --reason "..."`. `fo` retries within the limit or blocks the task.
 - The task has no verification commands (documentation, research): record what you checked with `fo check <ID> --name "..." --result pass|fail --note "<what you inspected and what you found>"`, then `fo verify <ID>`.
 
-**Review.** For a task in REVIEWING, read the diff (the verify output names the checkout) and the evidence, and work through the review questions in `${CLAUDE_SKILL_DIR}/references/verification-policy.md`. Then record the verdict:
+**Review.** For a task in REVIEWING, inspect the exact candidate commit, tree, base commit, changed-file list, diff, and verification evidence printed by `fo verify` and `fo review-package`. Use `git show <candidate>:<path>` to read candidate files and `git diff <base>...<candidate> --` to inspect changes from the project repository. The detached verification checkout is normally removed after checking. Do not inspect the project working tree as a substitute for the candidate. Work through the review questions in `${CLAUDE_SKILL_DIR}/references/verification-policy.md`, then record the verdict:
 
 ```bash
 node "${CLAUDE_SKILL_DIR}/scripts/fo.cjs" review <ID> --integrate --stdin <<'FO_EOF'
 task_id: <ID>
 reviewer: orchestrator
 candidate_commit: <full commit from verification, for Git tasks>
+# For shared tasks, replace candidate_commit with candidate_snapshot from verification.
 verdict: approve
 criteria:
   - met: true
@@ -120,6 +121,10 @@ FO_EOF
 ```
 
 One `criteria` entry per acceptance criterion, in order. Approve only what you checked. When `fo` asks for an independent review first, `fo review-package <ID>` prints the reviewer's Agent call; pass the reviewer's YAML to `fo review <ID> --agent-id <reviewer's host ID> --stdin`, then record your own. `--integrate` merges approved work into the run's integration branch, re-runs the checks on the merged result and completes the task, which releases its dependents.
+
+Every shared-mode review must include `candidate_snapshot` from the latest successful verification. A changed snapshot requires verification and fresh review. Correction attempts retain the original task baseline so they cannot absorb earlier unauthorized edits.
+
+If a reviewer never returns, inspect host status. Record that observation with `fo reconcile <ID> --review-dispatch-id <UUID> --liveness active|unknown|failed --reason "..."`. Add `--agent-id <host ID>` when known. An active reviewer cannot be replaced. For an unknown or failed reviewer, explicitly add `--abandon` only after deciding to invalidate that dispatch. `fo review-package <ID> --perspective <perspective>` then creates a replacement with a new UUID. Old reports remain invalid and the required independent review still applies. Silence never establishes failure.
 
 **Correct.** For CORRECTION_REQUIRED, write a targeted correction: the specific failure, the evidence, the expected behaviour, the one change required, and how it will be re-verified. Shape: `${CLAUDE_SKILL_DIR}/templates/correction-request.yaml`.
 

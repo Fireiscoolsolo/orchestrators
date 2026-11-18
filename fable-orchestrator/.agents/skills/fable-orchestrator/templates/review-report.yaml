@@ -1,9 +1,12 @@
 # Review report - recorded with: fo review <TASK-ID> --file <this file> [--integrate]
+# Independent report: fo review <TASK-ID> --agent-id <reviewer's host ID> --file <this file>
+# The orchestrator obtains the host identity from completion metadata, not from this report.
 # Accepted only while the task is REVIEWING, which it reaches only after verification passed.
 # An approve verdict is refused unless every acceptance criterion is met WITH evidence.
 
 task_id: AUTH-001
 candidate_commit: 3f9c2e1a7b4d5c6e8f0a1b2c3d4e5f6a7b8c9d0e  # use the verified commit for Git tasks
+# For shared tasks, replace candidate_commit with candidate_snapshot from successful verification.
 # Independent reviewers also copy attempt_id and review_dispatch_id from the review package.
 reviewer: orchestrator            # orchestrator | review-worker
 perspective: correctness          # correctness | security (independent reviews)

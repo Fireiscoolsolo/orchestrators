@@ -64,7 +64,19 @@ A rejection needs at least one specific finding or one unmet criterion; that fin
 
 ## Independent review
 
-When the plan shows `orchestrator + N independent`, `fo review-package <ID>` produces the prompt for a `review-worker`: the contract, where the change is and how to diff it, the evidence recorded so far, and the report shape. The reviewer is read-only and did not write the change. Its verdict is recorded with `fo review <ID> --stdin`; a rejection sends the task to CORRECTION_REQUIRED regardless of the orchestrator's view. With two required reviews the perspectives must differ (correctness, security).
+When the plan shows `orchestrator + N independent`, `fo review-package <ID>` produces the prompt for a `review-worker`: candidate commit and tree, base commit, changed files, diff, recorded verification evidence, and the report shape. Read pinned files with `git show <candidate>:<path>` from the project repository. The temporary verification checkout is normally removed. The reviewer is read-only and did not write the change. Submit its unchanged report with `fo review <ID> --agent-id <reviewer's host ID> --stdin`. Use the identity from the host completion metadata. The report must match the dispatch UUID, task attempt, required perspective, and candidate. A rejection sends the task to CORRECTION_REQUIRED. Two required perspectives need two different reviewer identities, both different from the implementation worker.
+
+An abandoned, failed, superseded, or completed dispatch cannot submit another review. Use the explicit reviewer reconciliation procedure in `recovery-policy.md` for a lost reviewer. Replacement does not bypass independent review.
+
+The named reviewer has file-read tools and cannot execute Git commands. The orchestrator runs the pinned `git show` commands under its own host permissions and supplies any surrounding source the reviewer needs as local evidence files. The reviewer must flag missing context instead of inspecting a different working-tree version or assuming that the diff is sufficient.
+
+## Shared workspace integrity
+
+Shared mode records a complete content baseline at dispatch, validates the worker report, and rechecks snapshots around setup, verification, integration, review, and delivery. Any persistent command mutation invalidates evidence, including a change inside the allowed scope. Correct or explicitly account for the change and verify again. Required setup failure stops later commands.
+
+All shared-mode review reports must identify the current `candidate_snapshot` printed by verification. Retried and corrected attempts retain the task's first baseline, so unauthorized edits cannot become accepted history. Changes by other processes or tasks since that baseline can require explicit reconciliation. Prefer isolated worktrees for interleaved work.
+
+Generated artifacts have no blanket exemption. Configure tools to write disposable output outside the project, or create stable in-scope artifacts before reporting and verify without changing them. Only the runtime directories and Git metadata excluded by the snapshot implementation are omitted. Never place source or test inputs in those directories. Shared scans cannot isolate concurrently running programs or prove the absence of transient writes; unrelated user changes are preserved and require reconciliation when they invalidate a snapshot.
 
 ## Corrections
 

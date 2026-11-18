@@ -153,21 +153,72 @@ class Store {
   }
 
   reap(owner) {
-    // Only one reaper can act on this token. Recheck after claiming to avoid removing a replacement lock.
-    const guard = `${this.lockPath}.reap-${owner.token}`;
-    try {
-      fs.mkdirSync(guard);
-    } catch (e) {
-      if (e.code === 'EEXIST') return false;
-      throw e;
-    }
-    try {
-      const current = readLock(this.lockPath);
-      if (!current || current.token !== owner.token || !ownerExited(current)) return false;
-      fs.unlinkSync(this.lockPath);
-      return true;
-    } finally {
-      fs.rmdirSync(guard);
+    const sameOwner = (a, b) => a && b && a.token === b.token && a.pid === b.pid && a.host === b.host;
+    if (!sameOwner(readLock(this.lockPath), owner) || !ownerExited(owner)) return false;
+    const root = `${this.lockPath}.reap-${owner.token}`;
+    const readGuard = (file) => {
+      try {
+        // Legacy directories and links have no trustworthy guard identity.
+        if (!fs.lstatSync(file).isFile()) return null;
+        return readLock(file);
+      } catch (e) {
+        if (['ENOENT', 'EISDIR'].includes(e.code)) return null;
+        throw e;
+      }
+    };
+    const reconcile = (file) => new OrchError('LOCK_REAPER_RECONCILIATION_REQUIRED',
+      `cannot establish recovery guard ownership: ${file}. Stop all processes using this run, confirm no owner can still execute, then move this guard aside as evidence before retrying.`, 1);
+    let predecessor = null;
+    const visited = new Set();
+    for (;;) {
+      const guard = predecessor ? `${root}-${predecessor}` : root;
+      if (visited.has(guard)) throw reconcile(guard);
+      visited.add(guard);
+      const record = {
+        token: randomUUID(), pid: process.pid, host: os.hostname(),
+        kind: 'state-lock-reaper', lock_token: owner.token, predecessor_token: predecessor,
+      };
+      const matches = (candidate) => sameOwner(candidate, record) && candidate.kind === record.kind
+        && candidate.lock_token === record.lock_token && candidate.predecessor_token === record.predecessor_token;
+      const claim = `${this.lockPath}.claim-${record.token}`;
+      let acquired = false;
+      fs.writeFileSync(claim, JSON.stringify(record), { flag: 'wx', mode: 0o600 });
+      try {
+        try {
+          // Publish complete metadata in one operation, including across a crash.
+          fs.linkSync(claim, guard);
+          acquired = true;
+        } catch (e) {
+          if (e.code !== 'EEXIST') throw e;
+        }
+      } finally {
+        fs.unlinkSync(claim);
+      }
+      if (!acquired) {
+        const previous = readGuard(guard);
+        // A live owner may have released its guard between link and read. Retry
+        // through lock(), which will also check whether the main lock changed.
+        if (!previous && !fs.existsSync(guard)) return false;
+        if (!previous || previous.kind !== record.kind || previous.lock_token !== owner.token
+          || previous.predecessor_token !== predecessor) throw reconcile(guard);
+        if (!ownerExited(previous)) return false;
+        // Never unlink or overwrite an abandoned guard. Its immutable token
+        // names the sole successor claim, avoiding a check-then-delete race
+        // between simultaneous reapers. Repeated crashes follow this chain.
+        predecessor = previous.token;
+        continue;
+      }
+      try {
+        if (!matches(readGuard(guard))) throw reconcile(guard);
+        const current = readLock(this.lockPath);
+        if (!sameOwner(current, owner) || !ownerExited(current)) return false;
+        fs.unlinkSync(this.lockPath);
+        return true;
+      } finally {
+        // Only the living owner removes its own guard. Dead predecessors remain
+        // as small recovery records; later lock generations use different paths.
+        if (matches(readGuard(guard))) fs.unlinkSync(guard);
+      }
     }
   }
 
@@ -612,7 +663,9 @@ function buildCheckpoint(state) {
         blocked: t.block ? `${t.block.kind}: ${clip(t.block.reason, 300)}` : null,
       };
     }),
-    integration: state.project.git ? { branch: state.project.git.integration_branch, delivery: state.delivery ? state.delivery.status : 'pending' } : { delivery: 'in place' },
+    integration: state.project.git
+      ? { branch: state.project.git.integration_branch, delivery: state.delivery ? state.delivery.status : 'pending' }
+      : { delivery: state.delivery ? state.delivery.status : 'pending', verified: state.delivery?.verified === true },
     budget: { agent_calls: state.budget.agent_calls, tokens_reported: state.budget.tokens_reported },
     next_actions: nextActions(state),
   };

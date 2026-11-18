@@ -31,6 +31,21 @@ function identity(cwd) {
 
 const available = () => git(process.cwd(), ['--version']).code === 0;
 
+function parseGitVersion(output) {
+  const m = /^git version (\d+)\.(\d+)\.(\d+)(?:[.-][\w.-]+)?(?: \([^\r\n)]+\))?$/.exec(String(output).trim());
+  return m ? m.slice(1).map((n) => Number(n || 0)) : null;
+}
+
+function requireWorktreeSupport(cwd, run = git) {
+  const result = run(cwd, ['--version']);
+  const version = result.code === 0 ? parseGitVersion(result.out) : null;
+  if (!version || version[0] < 2 || (version[0] === 2 && version[1] < 36)) {
+    const found = result.code !== 0 ? 'Git was not found' : `found ${JSON.stringify(result.out)}`;
+    throw new Error(`Git 2.36 or newer is required for worktree isolation (${found}). Upgrade Git or explicitly configure isolation.strategy: shared, which has no Git isolation guarantees.`);
+  }
+  return version;
+}
+
 function toplevel(dir) {
   const r = git(dir, ['rev-parse', '--show-toplevel']);
   return r.code === 0 && r.out ? path.resolve(r.out) : null;
@@ -101,12 +116,14 @@ function repository(dir) {
 }
 
 function registeredWorktrees(dir) {
+  requireWorktreeSupport(dir);
   const r = git(dir, ['worktree', 'list', '--porcelain', '-z']);
   if (r.code !== 0) throw new Error(`git worktree list failed: ${r.err}`);
   return splitPaths(r.raw).filter((s) => s.startsWith('worktree ')).map((s) => s.slice(9));
 }
 
 function worktreeAdd(root, dir, opts) {
+  requireWorktreeSupport(root);
   fs.mkdirSync(path.dirname(dir), { recursive: true });
   const args = ['worktree', 'add'];
   if (opts.detach) args.push('--detach', dir, opts.start);
@@ -116,6 +133,7 @@ function worktreeAdd(root, dir, opts) {
 }
 
 function worktreeRemove(root, dir) {
+  requireWorktreeSupport(root);
   const r = git(root, ['worktree', 'remove', dir]);
   return { ok: r.code === 0, message: r.err || r.out };
 }
@@ -247,6 +265,7 @@ function snapshotDiff(before, after) {
 }
 
 module.exports = {
+  parseGitVersion, requireWorktreeSupport,
   git, must, available, toplevel, inspect, dirtyFiles, revParse, isAncestor, branchExists, changedFiles,
   currentBranch, candidate, samePath, repository, registeredWorktrees,
   worktreeAdd, worktreeRemove, isWorktree, mergeInProgress, mergeAbort, mergeNoCommit, mergeCommit,

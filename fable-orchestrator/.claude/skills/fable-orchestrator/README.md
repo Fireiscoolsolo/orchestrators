@@ -8,7 +8,7 @@ The session that runs the skill is the orchestrator. It plans, reviews and decid
 
 - Claude Code 2.1.302 or newer (built and tested on 2.1.302; subagents that spawn subagents and `isolation: worktree` are used when present).
 - Node.js 18 or newer on PATH. The scripts have no dependencies.
-- Git 2.31 or newer for worktree isolation. Without git the skill falls back to a shared workspace.
+- Git 2.36 or newer for worktree isolation. The CLI enforces this before worktree operations. Without Git it falls back to a shared workspace. On an older Git version, upgrade or explicitly configure `isolation.strategy: shared` and accept its reduced guarantees.
 - Verification commands run under bash when it is available (Git Bash on Windows): write them with forward slashes.
 
 ## Install
@@ -102,7 +102,7 @@ Runtime state and the inbox can contain excerpts of your code and command output
 node --test .claude/skills/fable-orchestrator/scripts/tests/
 ```
 
-54 tests: the YAML subset, contract and report validation, scheduling, routing, the state machine and its invariants, persistence and recovery, and end-to-end runs of `fo` against real git repositories with the test playing the worker (including a merge conflict and an interrupted integration).
+The suite covers the YAML subset, contracts, routing, scheduling, worktree ownership, immutable candidates, independent review and reviewer recovery, shared workspace integrity, state and lock recovery, installation, and complete CLI runs in real Git repositories. These tests simulate workers. Read the test runner totals and the release validation report for executed counts and separate live-host evidence.
 
 ## Limitations
 

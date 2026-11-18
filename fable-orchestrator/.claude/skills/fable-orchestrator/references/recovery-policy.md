@@ -45,7 +45,15 @@ Every failure is appended to the task's `failures` list and the event log, and a
 
 After a context compaction the same command restores what matters. `checkpoint.yaml` in the run directory is rewritten after every state change and holds the same summary; it is the substitute for context measurements and programmatic compaction, neither of which Claude Code exposes to a running model.
 
-## Corrupted state
+## Lost independent reviewer
+
+`fo resume` retains outstanding reviewer dispatches and reports their status. Inspect the host's execution status before changing it. Record `active`, `unknown`, or `failed` with `fo reconcile <ID> --review-dispatch-id <UUID> --liveness <status> --reason "<host evidence or uncertainty>"`, including `--agent-id <host ID>` when available. These observations are operator supplied, not authenticated host attestations.
+
+A confirmed active reviewer cannot be abandoned or silently downgraded to unknown. Record a confirmed failure when the host establishes that it ended. For failed or unknown liveness, adding `--abandon` explicitly invalidates the outstanding dispatch while preserving its history. This does not stop a host process. When liveness is unknown, the operator accepts that it may still finish, but its late result will be rejected.
+
+Run `fo review-package <ID> --perspective <perspective>` for the replacement. It consumes the normal reviewer budget and has a new dispatch UUID bound to the current verified candidate. Supply the replacement's actual host identity when submitting its report. A changed candidate must be verified again. Duplicate or concurrent abandonment cannot create duplicate replacement dispatches.
+
+## Corrupted state recovery
 
 State is written to a temporary file and renamed into place, so a crash mid-write leaves the previous file intact. In addition `fo` keeps `state.json.bak` (the state before the last change) and a rolling set of snapshots.
 
@@ -54,3 +62,5 @@ If `state.json` cannot be parsed, `fo` loads the backup, then the newest snapsho
 ## Concurrent `fo` commands
 
 The run store uses an ownership token and can reclaim a local lock after detecting that its owner process has exited. Age alone never triggers reclamation. Project verification and merge trials run outside the state lock. The event batch committed with state can be replayed after an interrupted log write.
+
+Reaper guards atomically record ownership. A later process can follow dead-owner records to finish interrupted recovery without deleting another live process's guard. Dead guard records remain local evidence. Legacy empty or malformed guards have no provable ownership: stop all processes using that run, preserve and move the guard aside after reconciling ownership, then retry. Foreign-host ownership or a reused PID remains conservative and may require the same operator procedure.

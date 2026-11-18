@@ -4,7 +4,7 @@ Fable Orchestrator turns multi-step software requests into task contracts, route
 
 ## Install
 
-Use Node.js 18 or later and Git 2.31 or later. On Windows, use Git Bash for project verification commands. From this directory, install into an existing Claude Code project:
+Use Node.js 18 or later and Git 2.36 or later for worktree isolation. The CLI checks the Git version before creating a native or managed worktree. Explicit shared mode works without that version requirement, with serialized tasks and no immutable Git delivery guarantee. On Windows, use Git Bash for project verification commands. From this directory, install into an existing Claude Code project:
 
 ```bash
 node .claude/skills/fable-orchestrator/scripts/install.cjs --project "/path/to/project" --dry-run
@@ -35,5 +35,6 @@ The CLI tests use disposable repositories and worktrees, with workers and review
 - [Architecture](ARCHITECTURE.md)
 - [Security and host permissions](SECURITY.md)
 - [Known limitations](LIMITATIONS.md)
+- [Pending live validation procedure](LIVE-VALIDATION.md)
 - [Changelog](CHANGELOG.md)
 - [Contributing](CONTRIBUTING.md)

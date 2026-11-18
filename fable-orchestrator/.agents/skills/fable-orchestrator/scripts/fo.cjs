@@ -29,7 +29,7 @@ const RUNTIME = path.join('.claude', 'fable-orchestrator');
 // sensitive path and refuses model writes there, which helps prevent accidental edits to run state.
 const INBOX = '.fable-inbox';
 const INBOX_FILES = ['contracts.yaml', 'report.yaml', 'review.yaml', 'correction.yaml', 'request.txt'];
-const BOOL_FLAGS = new Set(['json', 'verify', 'integrate', 'reverify', 'user-authorized', 'all', 'plan-only', 'resume', 'status', 'help', 'stdin', 'force']);
+const BOOL_FLAGS = new Set(['json', 'verify', 'integrate', 'reverify', 'user-authorized', 'all', 'plan-only', 'resume', 'status', 'help', 'stdin', 'force', 'abandon']);
 const MULTI_FLAGS = new Set(['cmd']);
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const short = (sha) => (sha ? String(sha).slice(0, 10) : '');
@@ -271,6 +271,7 @@ function cmdInit(args) {
   let strategy = cfg.isolation.strategy;
   if (strategy === 'auto') strategy = g.enabled ? 'native' : 'shared';
   if (!g.enabled && strategy !== 'shared') { warnings.push(`isolation "${strategy}" needs git (${g.reason}); using the shared workspace`); strategy = 'shared'; }
+  if (strategy !== 'shared') gitops.requireWorktreeSupport(root);
   if (strategy === 'shared') warnings.push(`shared workspace (${g.enabled ? 'configured' : g.reason}): no worktree isolation; tasks are serialized and integration happens in place`);
   const dirty = g.enabled ? g.dirty.filter((f) => !f.replace(/\\/g, '/').startsWith('.claude/')) : [];
   if (dirty.length && strategy !== 'shared') warnings.push(`uncommitted changes (${dirty.slice(0, 8).join(', ')}${dirty.length > 8 ? ', ...' : ''}) stay untouched in your checkout and are NOT visible to workers in worktrees`);
@@ -517,10 +518,19 @@ function newAttempt(state, c, t) {
     } else {
       a.preexisting_worktrees = gitops.registeredWorktrees(root);
     }
-  } else {
+  }
+  if (!g) {
     const snap = gitops.fsSnapshot(root);
-    a.snapshot = path.join(c.runDir, 'snapshots', `${t.id}-a${n}.fs.json`);
-    fs.writeFileSync(a.snapshot, JSON.stringify(snap));
+    if (snap.truncated) throw new OrchError('INCOMPLETE_SNAPSHOT', 'Shared workspace baseline is incomplete. Resolve unreadable files or reduce the workspace before dispatch.');
+    const first = t.attempts[0];
+    if (first) {
+      // A retry must not legitimize unauthorized edits left by an earlier attempt.
+      sharedBaseline(first);
+      a.snapshot = first.snapshot;
+    } else {
+      a.snapshot = path.join(c.runDir, 'snapshots', `${t.id}-a${n}.fs.json`);
+      fs.writeFileSync(a.snapshot, JSON.stringify(snap));
+    }
   }
   t.attempts.push(a);
   return a;
@@ -798,17 +808,17 @@ function cmdReport(args) {
     const errors = v.errors.slice();
     const warnings = v.warnings.slice();
     const r = v.report;
-    if (!errors.length && r.status === 'implemented' && a.isolation !== 'none') {
-      if (g) {
+    if (!errors.length && r.status === 'implemented') {
+      if (g && a.isolation !== 'none') {
         locateWork(state, t, a, r, errors, warnings);
-      } else if (a.snapshot) {
-        const before = JSON.parse(fs.readFileSync(a.snapshot, 'utf8'));
-        const after = gitops.fsSnapshot(state.project.root);
-        if (before.truncated || after.truncated) throw new OrchError('INCOMPLETE_SCOPE', 'shared workspace snapshot was incomplete');
+      } else if (!g) {
+        const before = sharedBaseline(a);
+        const after = sharedSnapshot(state.project.root);
         const diff = gitops.snapshotDiff(before.files, after.files);
         const mine = (f) => t.contract.file_scope.some((p) => sched.matchPath(p, f));
         a.changed_files = diff.filter(mine);
         a.out_of_scope = diff.filter((f) => !mine(f));
+        a.report_snapshot = after;
       }
     }
     if (errors.length) {
@@ -913,6 +923,73 @@ function runCandidateChecks(c, id, cycle, tag, commands, dir, timeout, candidate
   return results;
 }
 
+function requireCompleteSnapshot(snapshot) {
+  if (!snapshot || snapshot.truncated !== false || !isObj(snapshot.files) ||
+      Object.values(snapshot.files).some((value) => typeof value !== 'string' || !value)) {
+    throw new OrchError('INCOMPLETE_SCOPE', 'shared workspace snapshot was incomplete or missing; reconcile the workspace before retrying');
+  }
+  return snapshot;
+}
+
+function sharedSnapshot(root) {
+  return requireCompleteSnapshot(gitops.fsSnapshot(root));
+}
+
+function snapshotId(snapshot) {
+  requireCompleteSnapshot(snapshot);
+  return crypto.createHash('sha256').update(JSON.stringify(Object.entries(snapshot.files).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0))).digest('hex');
+}
+
+function sharedBaseline(attempt) {
+  try {
+    return requireCompleteSnapshot(JSON.parse(fs.readFileSync(attempt?.snapshot || '', 'utf8')));
+  } catch (error) {
+    if (error instanceof OrchError) throw error;
+    throw new OrchError('INCOMPLETE_SCOPE', 'shared dispatch baseline is missing or unreadable; reconcile before retrying');
+  }
+}
+
+// Shared mode detects observable content changes, but cannot isolate another process.
+// Every command must leave the full observed workspace unchanged, including outputs.
+function assessShared(root, baseline, scope, expected, cycle, stage) {
+  const checks = [];
+  let snapshot = null;
+  try {
+    requireCompleteSnapshot(baseline);
+    if (expected) requireCompleteSnapshot(expected);
+    snapshot = sharedSnapshot(root);
+    const changed = gitops.snapshotDiff(baseline.files, snapshot.files);
+    const outside = changed.filter((file) => !scope.some((pattern) => sched.matchPath(pattern, file)));
+    checks.push({ cycle, kind: 'scope', name: 'file scope', passed: !outside.length, at: nowIso(), stage,
+      detail: outside.length ? `modified outside the authorized scope: ${outside.join(', ')}` : `${changed.length} changed file(s), all inside the authorized scope` });
+    const drift = expected ? gitops.snapshotDiff(expected.files, snapshot.files) : [];
+    checks.push({ cycle, kind: 'candidate', name: 'shared workspace integrity', passed: !drift.length, at: nowIso(), stage,
+      snapshot_id: snapshotId(snapshot), detail: drift.length
+        ? `shared workspace changed ${stage}: ${drift.join(', ')}; reconcile, reverify, and review again`
+        : `complete content snapshot ${snapshotId(snapshot)} (${stage})` });
+  } catch (error) {
+    checks.push({ cycle, kind: 'scope', name: 'file scope', passed: false, at: nowIso(), stage, detail: error.message });
+  }
+  return { checks, snapshot };
+}
+
+function runSharedChecks(c, id, cycle, tag, commands, root, timeout, setup, baseline, scope, expected) {
+  const initial = assessShared(root, baseline, scope, expected, cycle, 'before checks');
+  const results = [...initial.checks];
+  let snapshot = initial.snapshot;
+  if (results.every((check) => check.passed)) {
+    for (const [i, cmd] of [setup, ...commands].filter(Boolean).entries()) {
+      const result = runAndRecord(c, id, cycle, `${tag}${i + 1}`, cmd, root, timeout);
+      results.push(result);
+      const after = assessShared(root, baseline, scope, snapshot, cycle, `after command ${i + 1}`);
+      results.push(...after.checks);
+      snapshot = after.snapshot;
+      if (after.checks.some((check) => !check.passed) || i === 0 && setup && !result.passed) break;
+    }
+  }
+  return { results, snapshot };
+}
+
 function extraCommands(args) {
   const extra = [].concat(args.flags.cmd || []);
   if (args.rest && args.rest.length) extra.push(args.rest.map((x) => (/[\s"']/.test(x) ? JSON.stringify(x) : x)).join(' '));
@@ -929,10 +1006,19 @@ function cmdVerify(args) {
   const extra = extraCommands(args);
   const plan = c.store.transact((state) => {
     const t = sm.getTask(state, id);
+    if (t.state === 'REVIEWING' && args.flags.reverify) {
+      const reason = needFlag(args, 'reason');
+      if ((t.review_dispatches || []).some((dispatch) => dispatch.cycle === t.verify_cycle && ['active', 'unknown'].includes(reviewDispatchStatus(dispatch)))) {
+        throw new OrchError('REVIEW_IN_PROGRESS', 'reconcile outstanding reviewer identities before replacing their verification cycle');
+      }
+      sm.transition(state, id, 'CORRECTION_REQUIRED', { reason: `verification invalidated: ${reason}` });
+    }
     if (t.state === 'IMPLEMENTED') {
+      delete t.pending_verification_snapshot;
       t.verify_cycle++;
       sm.transition(state, id, 'VERIFYING', { reason: `verification cycle ${t.verify_cycle}` });
     } else if (t.state === 'CORRECTION_REQUIRED' && args.flags.reverify) {
+      delete t.pending_verification_snapshot;
       const reason = needFlag(args, 'reason');
       t.review_round++; // re-verifying without a new attempt still consumes a correction round
       t.verify_cycle++;
@@ -944,18 +1030,25 @@ function cmdVerify(args) {
     }
     const a = sm.lastAttempt(t);
     if (t.verification_operation) throw new OrchError('VERIFICATION_IN_PROGRESS', `${id}: a previous verifier may still be active`);
+    const baseline = state.project.git ? null : sharedBaseline(a);
     t.verification_operation = { id: crypto.randomUUID(), pid: process.pid };
     const candidate = state.project.git ? gitops.candidate(state.project.root, a.commit || a.base) : null;
+    delete t.verified_snapshot;
+    delete t.verified_snapshot_id;
+    delete t.verified_candidate;
     return {
       cmds: t.contract.verification_commands.concat(extra), cwd: state.project.root, cycle: t.verify_cycle,
       setup: state.config.integration.setup_command, operation: t.verification_operation.id, candidate,
+      base: a.base, baseline, scope: t.contract.file_scope,
+      expected: baseline && !args.flags.reverify ? requireCompleteSnapshot(t.pending_verification_snapshot || a.report_snapshot) : null,
       timeout: state.config.verification.command_timeout_seconds * 1000,
     };
   });
 
-  const results = plan.candidate
-    ? withCandidateCheckout(c, plan.cwd, plan.candidate.commit, (dir) => runCandidateChecks(c, id, plan.cycle, 'v', plan.cmds, dir, plan.timeout, plan.candidate, plan.setup))
-    : plan.cmds.map((cmd, i) => runAndRecord(c, id, plan.cycle, `v${i + 1}`, cmd, plan.cwd, plan.timeout));
+  const trial = plan.candidate
+    ? { results: withCandidateCheckout(c, plan.cwd, plan.candidate.commit, (dir) => runCandidateChecks(c, id, plan.cycle, 'v', plan.cmds, dir, plan.timeout, plan.candidate, plan.setup)) }
+    : runSharedChecks(c, id, plan.cycle, 'v', plan.cmds, plan.cwd, plan.timeout, plan.setup, plan.baseline, plan.scope, plan.expected);
+  const results = trial.results;
 
   const out = c.store.transact((state) => {
     const t = sm.getTask(state, id);
@@ -964,8 +1057,13 @@ function cmdVerify(args) {
     }
     delete t.verification_operation;
     const a = sm.lastAttempt(t);
+    if (!plan.candidate) {
+      const final = assessShared(plan.cwd, plan.baseline, plan.scope, trial.snapshot, plan.cycle, 'before recording verification');
+      results.push(...final.checks);
+      trial.snapshot = final.snapshot;
+    }
     t.checks.push(...results);
-    if (a && a.isolation !== 'none' && a.changed_files) {
+    if (plan.candidate && a && a.isolation !== 'none' && a.changed_files) {
       const outside = a.changed_files.filter((f) => !t.contract.file_scope.some((p) => sched.matchPath(p, f))).concat(a.out_of_scope || []);
       t.checks.push({
         cycle: plan.cycle, kind: 'scope', name: 'file scope', passed: outside.length === 0, at: nowIso(),
@@ -975,6 +1073,7 @@ function cmdVerify(args) {
     const cur = sm.currentChecks(t);
     const failed = cur.filter((x) => !x.passed);
     if (!failed.length && !cur.some((x) => x.kind === 'manual' || x.kind === 'command' && plan.cmds.includes(x.cmd))) {
+      if (!plan.candidate) t.pending_verification_snapshot = requireCompleteSnapshot(trial.snapshot);
       return { noEvidence: true };
     }
     if (failed.length) {
@@ -984,14 +1083,24 @@ function cmdVerify(args) {
       sm.transition(state, id, 'CORRECTION_REQUIRED', { reason: `verification failed: ${failed.map((f) => clip(f.name, 80)).join(', ')}` });
     } else {
       t.verified_candidate = plan.candidate;
+      if (!plan.candidate) {
+        t.verified_snapshot = requireCompleteSnapshot(trial.snapshot);
+        t.verified_snapshot_id = snapshotId(trial.snapshot);
+      }
       t.verified_commands = plan.cmds;
+      delete t.pending_verification_snapshot;
       sm.transition(state, id, 'REVIEWING', { reason: `${cur.length} check(s) passed` });
     }
-    return { state: t.state, checks: cur, gate: sm.reviewGate(t), left: sm.maxRounds(state, t) - t.review_round, independent: t.route.review.independent };
+    return { state: t.state, checks: cur, gate: sm.reviewGate(t), left: sm.maxRounds(state, t) - t.review_round, independent: t.route.review.independent, snapshot_id: t.verified_snapshot_id };
   });
   if (out.noEvidence) throw new OrchError('NO_VERIFICATION_EVIDENCE', `${id}: record a manual check or add verification commands before review`);
 
-  const L = [`${id}: verification cycle ${plan.cycle} in ${plan.cwd}`];
+  const L = [`${id}: verification cycle ${plan.cycle}`];
+  if (plan.candidate) {
+    L.push(`  candidate commit: ${plan.candidate.commit}`, `  candidate tree: ${plan.candidate.tree}`, `  candidate base: ${plan.base}`,
+      `  inspect: git show ${plan.candidate.commit}`, `  inspect changes: git diff ${plan.base} ${plan.candidate.commit}`, `  repository: ${plan.cwd}`);
+  } else L.push(`  shared workspace: ${plan.cwd}`, '  shared checks bind a complete content snapshot; external writes are not isolated',
+    ...(out.state === 'REVIEWING' ? [`  candidate_snapshot: ${out.snapshot_id}`] : []));
   for (const k of out.checks) {
     L.push(`  ${k.passed ? 'PASS' : 'FAIL'} [${k.kind}] ${k.name}${k.kind === 'command' ? ` (exit ${k.timed_out ? 'TIMEOUT' : k.exit_code}, ${k.evidence})` : ` - ${k.detail}`}`);
     if (!k.passed && k.output_tail) L.push(...k.output_tail.split('\n').map((l) => `      | ${l}`));
@@ -1027,6 +1136,37 @@ function cmdCheck(args) {
 
 // ---------------------------------------------------------------- review
 
+function reviewDispatchStatus(dispatch) {
+  return dispatch.status || (dispatch.agent_id ? 'completed' : 'unknown');
+}
+
+function setReviewDispatchStatus(dispatch, status, reason) {
+  const before = reviewDispatchStatus(dispatch);
+  if (before === status) return;
+  dispatch.history ||= [{ status: before, at: dispatch.dispatched_at || null, reason: 'existing dispatch' }];
+  dispatch.history.push({ status, previous: before, at: nowIso(), reason, agent_id: dispatch.agent_id || null });
+  dispatch.status = status;
+}
+
+function currentReviewCandidate(state, task) {
+  if (!state.project.git) {
+    const recorded = task.verified_snapshot;
+    if (!recorded || recorded.truncated || !task.verified_snapshot_id ||
+        snapshotId(sharedSnapshot(state.project.root)) !== task.verified_snapshot_id) {
+      throw new OrchError('STALE_EVIDENCE', 'shared workspace changed after verification or lacks complete verification evidence; verify again before review');
+    }
+    return { commit: null, tree: null, snapshot_id: task.verified_snapshot_id };
+  }
+  const attempt = sm.lastAttempt(task);
+  const recorded = task.verified_candidate;
+  if (!attempt || !recorded || recorded.commit !== (attempt.commit || attempt.base)) {
+    throw new OrchError('STALE_EVIDENCE', 'candidate changed after verification; verify the current attempt before review');
+  }
+  const actual = gitops.candidate(state.project.root, recorded.commit);
+  if (actual.tree !== recorded.tree) throw new OrchError('STALE_EVIDENCE', 'candidate tree does not match verification');
+  return recorded;
+}
+
 function cmdReviewPackage(args) {
   const c = ctx(args);
   const id = need(args, 0, 'task id');
@@ -1039,11 +1179,21 @@ function cmdReviewPackage(args) {
     if (!required.includes(perspective) || done.has(perspective)) throw new OrchError('INVALID_PERSPECTIVE', 'choose an outstanding required review perspective');
     if (sm.budgetStatus(state).exceeded) throw new OrchError('BUDGET_LIMIT', 'agent-call budget is exhausted');
     const a = sm.lastAttempt(t);
-    const dispatch = { id: crypto.randomUUID(), perspective, cycle: t.verify_cycle, attempt: a.attempt_id,
-      candidate: t.verified_candidate?.commit || null, agent_id: null };
+    const candidate = currentReviewCandidate(state, t);
+    const dispatch = { id: crypto.randomUUID(), task_id: id, perspective, cycle: t.verify_cycle, attempt: a.attempt_id,
+      candidate: candidate?.commit || null, candidate_tree: candidate?.tree || null, agent_id: null,
+      candidate_snapshot: candidate?.snapshot_id || null, status: 'unknown', dispatched_at: nowIso() };
+    dispatch.history = [{ status: 'unknown', at: dispatch.dispatched_at, reason: 'dispatch issued; host liveness not yet recorded' }];
     t.review_dispatches ||= [];
-    if (t.review_dispatches.some((d) => d.cycle === dispatch.cycle && d.perspective === perspective)) {
-      throw new OrchError('REVIEW_ALREADY_DISPATCHED', 'a review for this perspective has already been dispatched');
+    const previous = t.review_dispatches.filter((d) => d.cycle === dispatch.cycle && d.perspective === perspective);
+    const outstanding = previous.find((d) => ['active', 'unknown', 'completed'].includes(reviewDispatchStatus(d)));
+    if (outstanding) {
+      throw new OrchError('REVIEW_ALREADY_DISPATCHED', `review ${outstanding.id} is ${reviewDispatchStatus(outstanding)}. Inspect host status, then explicitly reconcile that dispatch before replacing it`);
+    }
+    for (const prior of previous.filter((d) => ['abandoned', 'failed'].includes(reviewDispatchStatus(d)))) {
+      prior.resolution = reviewDispatchStatus(prior);
+      setReviewDispatchStatus(prior, 'superseded', `replaced by ${dispatch.id}`);
+      prior.superseded_by = dispatch.id;
     }
     t.review_dispatches.push(dispatch);
     const k = t.contract;
@@ -1054,15 +1204,19 @@ function cmdReviewPackage(args) {
     k.acceptance_criteria.forEach((x, i) => L.push(`${i + 1}. ${x}`));
     L.push(`Authorized file scope: ${k.file_scope.join(', ') || '(read-only task)'}`);
     L.push('', '## The change');
-    if (a && a.commit) {
-      const diff = gitops.git(where, ['diff', '--no-ext-diff', '--no-textconv', '--no-color', `${a.base}...${a.commit}`, '--']);
+    if (candidate.commit) {
+      const diff = gitops.git(where, ['diff', '--no-ext-diff', '--no-textconv', '--no-color', `${a.base}...${candidate.commit}`, '--']);
       if (diff.code !== 0) throw new OrchError('DIFF_UNAVAILABLE', 'could not generate the candidate review diff');
       const evidence = path.join(c.runDir, 'evidence', `${id}-review-${dispatch.id}.diff`);
       sm.writeAtomic(evidence, diff.raw);
-      L.push(`Read the diff at ${evidence} (generated by git diff ${a.base}...${a.commit}).`,
-        `Verified commit: ${a.commit}`, `Changed files: ${(a.changed_files || []).join(', ') || '(none)'}`);
+      L.push(`Read the diff at ${evidence} (generated by git diff ${a.base}...${candidate.commit}).`,
+        `Verified commit: ${candidate.commit}`, `Verified tree: ${candidate.tree}`, `Base commit: ${a.base}`,
+        `Ask the orchestrator to supply exact surrounding file content using git show ${candidate.commit}:<path> in repository ${where}. Your read-only tools cannot execute that command. Do not substitute working-tree files.`,
+        `Changed files: ${(a.changed_files || []).join(', ') || '(none)'}`);
     }
-    else L.push(`Project directory: ${where}`, `Changed files: ${(a && a.changed_files ? a.changed_files : []).join(', ') || '(see the worker summary)'}`);
+    else L.push(`Project directory: ${where}`, `Verified shared snapshot: ${candidate.snapshot_id}`,
+      'Shared files remain mutable. Report any changes or missing evidence; freshness is checked again when this review is recorded.',
+      `Changed files: ${(a && a.changed_files ? a.changed_files : []).join(', ') || '(see the worker summary)'}`);
     if (a && a.report) L.push(`Author summary (unverified): ${a.report.summary}`, `Known issues reported: ${a.report.known_issues.join('; ') || 'none'}`);
     L.push('', `## Verification already recorded (cycle ${t.verify_cycle})`);
     for (const x of sm.currentChecks(t)) L.push(`- ${x.passed ? 'PASS' : 'FAIL'} [${x.kind}] ${x.name}${x.evidence ? ` (${path.join(c.runDir, x.evidence)})` : ''}`);
@@ -1075,10 +1229,11 @@ function cmdReviewPackage(args) {
     L.push('```yaml', `task_id: ${id}`, 'reviewer: review-worker', `perspective: ${perspective}`, 'verdict: approve            # approve | reject', 'criteria:                   # one entry per acceptance criterion, in order');
     k.acceptance_criteria.forEach(() => L.push('  - met: true', '    evidence: <what you observed: file:line, command and result>'));
     L.push(`review_dispatch_id: ${dispatch.id}`, `attempt_id: ${dispatch.attempt}`);
-    if (dispatch.candidate) L.push(`candidate_commit: ${dispatch.candidate}`);
+    if (dispatch.candidate) L.push(`candidate_commit: ${dispatch.candidate}`, `candidate_tree: ${dispatch.candidate_tree}`);
+    if (dispatch.candidate_snapshot) L.push(`candidate_snapshot: ${dispatch.candidate_snapshot}`);
     L.push('findings: []                # when rejecting: each defect, where it is, and why it matters', '```');
     state.budget.agent_calls++;
-    sm.emit(state, { type: 'review_dispatched', task: id, perspective });
+    sm.emit(state, { type: 'review_dispatched', task: id, dispatch: dispatch.id, attempt: dispatch.attempt, candidate: dispatch.candidate, perspective });
     return { text: L.join('\n'), model: t.route.tier.startsWith('lead') ? 'opus' : 'sonnet' };
   });
   console.log(`REVIEW DISPATCH for ${id}\nAgent call: subagent_type=fable-orchestrator-review-worker | model=${out.model} | description="Review ${id}"\n  If this restricted agent is unavailable, install it before dispatch.\n--- prompt: pass verbatim ---\n${out.text}\n--- end prompt ---\nThen pass the review YAML with the distinct host completion ID: fo review ${id} --agent-id <host ID> --stdin`);
@@ -1094,26 +1249,41 @@ function cmdReview(args) {
     const v = V.validateReview(raw, t);
     if (v.errors.length) throw new OrchError('INVALID_REVIEW', [`${id}: review rejected (state unchanged):`].concat(v.errors.map((e) => `  - ${e}`)).join('\n'));
     const r = Object.assign({ cycle: t.verify_cycle, at: nowIso() }, v.review);
-    const candidate = t.verified_candidate?.commit || null;
-    if (state.project.git && (!candidate || raw.candidate_commit !== candidate)) {
-      throw new OrchError('STALE_EVIDENCE', 'review must identify the commit that passed verification');
+    const identity = currentReviewCandidate(state, t);
+    const candidate = identity.commit;
+    if ((state.project.git && (!candidate || raw.candidate_commit !== candidate)) ||
+        (!state.project.git && raw.candidate_snapshot !== identity.snapshot_id) ||
+        (raw.candidate_tree !== undefined && raw.candidate_tree !== identity.tree) ||
+        (raw.candidate_snapshot !== undefined && raw.candidate_snapshot !== identity.snapshot_id)) {
+      throw new OrchError('STALE_EVIDENCE', 'review must identify the candidate that passed verification');
     }
     if (r.reviewer === 'review-worker') {
       const agent = needFlag(args, 'agent-id');
       const dispatch = (t.review_dispatches || []).find((d) => d.id === raw.review_dispatch_id);
       const author = sm.lastAttempt(t);
-      if (!dispatch || dispatch.agent_id || dispatch.cycle !== t.verify_cycle || dispatch.perspective !== r.perspective ||
+      if (!dispatch || !['active', 'unknown'].includes(reviewDispatchStatus(dispatch)) ||
+          (dispatch.task_id && dispatch.task_id !== id) ||
+          (dispatch.agent_id && dispatch.agent_id !== agent) || dispatch.cycle !== t.verify_cycle || dispatch.perspective !== r.perspective ||
           dispatch.attempt !== author.attempt_id || dispatch.attempt !== raw.attempt_id || dispatch.candidate !== candidate ||
-          author.agent_id === agent || (t.review_dispatches || []).some((d) => d.agent_id === agent)) {
+          (dispatch.candidate_tree && dispatch.candidate_tree !== t.verified_candidate?.tree) ||
+          (!state.project.git && dispatch.candidate_snapshot !== identity.snapshot_id) ||
+          author.agent_id === agent || (t.review_dispatches || []).some((d) => d !== dispatch && d.agent_id === agent)) {
         throw new OrchError('INVALID_REVIEW_DISPATCH', 'reviewer or dispatch identity is missing, reused, or does not match this verification');
       }
+      dispatch.status = reviewDispatchStatus(dispatch);
       dispatch.agent_id = agent;
+      setReviewDispatchStatus(dispatch, 'completed', `review ${r.verdict}`);
+      dispatch.completed_at = nowIso();
+      dispatch.verdict = r.verdict;
       r.reviewer_dispatch_id = dispatch.id;
       r.reviewer_agent_id = agent;
+      r.attempt_id = dispatch.attempt;
     }
     r.candidate_commit = candidate;
+    r.candidate_tree = identity.tree;
+    if (identity.snapshot_id) r.candidate_snapshot = identity.snapshot_id;
     t.reviews.push(r);
-    fs.writeFileSync(path.join(c.runDir, 'reviews', `${id}-c${t.verify_cycle}-${sm.currentReviews(t).length}.yaml`), yaml.dump(v.review));
+    sm.writeAtomic(path.join(c.runDir, 'reviews', `${id}-c${t.verify_cycle}-${sm.currentReviews(t).length}.yaml`), yaml.dump(r));
     const gate = sm.reviewGate(t);
     if (gate.rejected) sm.transition(state, id, 'CORRECTION_REQUIRED', { reason: `review rejected by ${r.reviewer}: ${clip(r.findings[0] || 'acceptance criteria not met', 160)}` });
     else if (gate.satisfied) sm.transition(state, id, 'APPROVED', { reason: 'verification passed and reviews approved' });
@@ -1234,6 +1404,8 @@ function cmdIntegrate(args) {
       cmds: cmds.concat(extra), git: !!g, commit: a ? a.commit : null, dir: g ? g.integration_path : state.project.root,
       root: state.project.root, tip: g ? gitops.revParse(g.integration_path, 'HEAD') : null, branch: g ? g.integration_branch : null,
       setup: state.config.integration.setup_command, operation: t.integration_operation.id,
+      baseline: g ? null : sharedBaseline(a), scope: t.contract.file_scope,
+      expected: g ? null : requireCompleteSnapshot(t.verified_snapshot),
       cycle: t.verify_cycle, title: t.contract.title, timeout: state.config.verification.command_timeout_seconds * 1000,
     };
   });
@@ -1253,7 +1425,7 @@ function cmdIntegrate(args) {
       const results = runCandidateChecks(c, id, plan.cycle, 'i', plan.cmds, dir, plan.timeout, candidate, plan.setup);
       return { candidate, results, already };
     })
-    : { results: [plan.setup, ...plan.cmds].filter(Boolean).map((cmd, i) => runAndRecord(c, id, plan.cycle, `i${i + 1}`, cmd, plan.dir, plan.timeout)) };
+    : runSharedChecks(c, id, plan.cycle, 'i', plan.cmds, plan.dir, plan.timeout, plan.setup, plan.baseline, plan.scope, plan.expected);
   const { candidate, conflict, results, already } = trial;
   const failed = results.filter((r) => !r.passed);
   let mergeSha = null;
@@ -1261,6 +1433,12 @@ function cmdIntegrate(args) {
   const out = c.store.transact((state) => {
     const t = sm.getTask(state, id);
     if (t.state !== 'INTEGRATING' || t.integration_operation?.id !== plan.operation) throw new OrchError('STATE_CHANGED', `${id} changed state during integration`);
+    if (!plan.git) {
+      const final = assessShared(plan.root, plan.baseline, plan.scope, trial.snapshot, plan.cycle, 'before recording integration');
+      results.push(...final.checks);
+      failed.push(...final.checks.filter((check) => !check.passed));
+      trial.snapshot = final.snapshot;
+    }
     if (candidate && !failed.length) {
       if (gitops.currentBranch(plan.dir) !== plan.branch || gitops.revParse(plan.dir, 'HEAD') !== plan.tip ||
           gitops.dirtyFiles(plan.dir).length) throw new OrchError('INTEGRATION_MOVED', 'integration checkout changed while checks ran');
@@ -1279,6 +1457,10 @@ function cmdIntegrate(args) {
     };
     delete t.integration_operation;
     if (t.integration.passed) {
+      if (!plan.git) {
+        state.project.shared_integration = { snapshot: requireCompleteSnapshot(trial.snapshot), snapshot_id: snapshotId(trial.snapshot), task_id: id, at: nowIso() };
+        t.integration.snapshot_id = state.project.shared_integration.snapshot_id;
+      }
       sm.transition(state, id, 'COMPLETED', { reason: mergeSha ? `merged into the integration branch as ${short(mergeSha)}` : already ? 'already on the integration branch; checks passed' : 'integration checks passed' });
       recordOutcome(c, state, t, true);
       sm.refresh(state);
@@ -1317,6 +1499,7 @@ function cmdDeliver(args) {
   const g = pre.project.git;
   const target = g?.verified_integration;
   let audit = [];
+  let sharedAudit = null;
   const reg = pre.config.integration.regression_command;
   if (target && gitops.revParse(pre.project.root, g.integration_branch) === target.commit) {
     const commands = pre.order.flatMap((id) => {
@@ -1327,6 +1510,15 @@ function cmdDeliver(args) {
     const setup = pre.config.integration.setup_command;
     audit = withCandidateCheckout(c, pre.project.root, target.commit, (dir) => runCandidateChecks(c, 'RUN', 0, 'final-audit-', [...new Set(commands)], dir, pre.config.verification.command_timeout_seconds * 1000, target, setup));
   }
+  if (!g && pre.order.length && pre.order.every((id) => sm.TERMINAL.includes(pre.tasks[id].state))) {
+    const baseline = pre.project.shared_integration?.snapshot;
+    const commands = pre.order.flatMap((id) => pre.tasks[id].state === 'COMPLETED' ? pre.tasks[id].integration?.commands || pre.tasks[id].contract.verification_commands : []);
+    if (reg) commands.push(reg);
+    const scope = pre.order.flatMap((id) => pre.tasks[id].contract.file_scope);
+    sharedAudit = runSharedChecks(c, 'RUN', 0, 'final-audit-', [...new Set(commands)], pre.project.root,
+      pre.config.verification.command_timeout_seconds * 1000, pre.config.integration.setup_command, baseline, scope, baseline);
+    audit = sharedAudit.results;
+  }
   const out = c.store.transact((state) => {
     if (state.delivery_operation?.id !== pre.delivery_operation.id) throw new OrchError('STATE_CHANGED', 'delivery state changed while checks ran');
     delete state.delivery_operation;
@@ -1334,7 +1526,18 @@ function cmdDeliver(args) {
     const gg = state.project.git;
     const open = state.order.filter((id) => !sm.TERMINAL.includes(state.tasks[id].state));
     if (!gg) {
-      state.delivery = { status: 'in_place', at: nowIso(), detail: 'shared workspace: changes were made directly in the project directory' };
+      if (sharedAudit) {
+        const final = assessShared(state.project.root, pre.project.shared_integration?.snapshot,
+          state.order.flatMap((id) => state.tasks[id].contract.file_scope), sharedAudit.snapshot, 0, 'before recording delivery');
+        audit.push(...final.checks);
+      }
+      const verified = !!sharedAudit && audit.every((check) => check.passed);
+      state.delivery = !open.length && !verified
+        ? { status: 'not_delivered', at: nowIso(), reason: 'shared workspace has no valid final content verification; reconcile and reverify changed work', checks: audit }
+        : { status: 'in_place', at: nowIso(), verified, checks: audit,
+          snapshot_id: verified ? snapshotId(sharedAudit.snapshot) : null,
+          detail: verified ? 'shared workspace: final content snapshot checked; external writes are not isolated and no immutable Git commit is delivered'
+            : 'shared workspace: changes are already in the project directory; unfinished work has not been verified for delivery' };
     } else if (!gg.integration_branch) {
       state.delivery = { status: 'nothing_to_deliver', at: nowIso() };
     } else if (!target || !audit.length || gitops.revParse(state.project.root, gg.integration_branch) !== target.commit) {
@@ -1355,16 +1558,20 @@ function cmdDeliver(args) {
           : { status: 'not_delivered', at: nowIso(), branch: gg.integration_branch, reason: `fast-forward refused (your branch moved, or local changes would be overwritten): ${clip(ff.output, 300)}` };
       }
     }
-    if (state.delivery.status === 'delivered' || state.delivery.status === 'in_place') state.phase = open.length ? state.phase : 'DELIVERED';
+    if (!open.length && (state.delivery.status === 'delivered' || state.delivery.status === 'in_place' && state.delivery.verified === true)) state.phase = 'DELIVERED';
+    else if (state.phase === 'DELIVERED') state.phase = 'EXECUTING';
     sm.emit(state, { type: 'delivery', status: state.delivery.status });
     return { d: state.delivery, open, sum };
   });
   const d = out.d;
   const L = [`DELIVERY: ${d.status}`];
   if (d.status === 'delivered') L.push(`  ${g.base_branch} fast-forwarded to ${short(d.head)} (${out.sum.counts.COMPLETED} completed task(s)). Uncommitted changes in your checkout were left as they were.`);
-  if (d.reason) L.push(`  ${d.reason}`, `  Inspect integration branch ${d.branch} and its recorded evidence before any manual merge.`);
+  if (d.reason) {
+    L.push(`  ${d.reason}`);
+    if (d.branch) L.push(`  Inspect integration branch ${d.branch} and its recorded evidence before any manual merge.`);
+  }
   if (d.detail) L.push(`  ${d.detail}`);
-  if (out.open.length) L.push(`  note: ${out.open.length} task(s) are not finished (${out.open.join(', ')}); only completed work is on the integration branch.`);
+  if (out.open.length) L.push(`  note: ${out.open.length} task(s) are not finished (${out.open.join(', ')}); ${g ? 'only completed work is on the integration branch' : 'their edits remain in the shared workspace'}.`);
   L.push('NEXT: fo final-report');
   console.log(L.join('\n'));
 }
@@ -1639,6 +1846,15 @@ function cmdResume(args) {
         notes.push(`${id}: verification may still be active. Confirm it stopped before running fo reconcile.`);
       } else if (t.state === 'INTEGRATING') {
         notes.push(`${id}: integration may still be active. Inspect its worktree before running fo reconcile.`);
+      } else if (t.state === 'REVIEWING') {
+        for (const dispatch of (t.review_dispatches || []).filter((d) => d.cycle === t.verify_cycle)) {
+          const status = reviewDispatchStatus(dispatch);
+          if (['active', 'unknown'].includes(status)) {
+            notes.push(`${id}: review ${dispatch.id} (${dispatch.perspective}) is ${status}; retained without replacement. Check the host, then use fo reconcile ${id} --review-dispatch-id ${dispatch.id} --liveness active|unknown|failed --reason <host result>. Unknown liveness requires an explicit --abandon decision before replacement.`);
+          } else if (['abandoned', 'failed'].includes(status)) {
+            notes.push(`${id}: review ${dispatch.id} is ${status}; its late reports are rejected. Use fo review-package ${id} --perspective ${dispatch.perspective} for a replacement.`);
+          }
+        }
       }
     }
     if (state.delivery_operation) notes.push('Delivery may still be active. Inspect the destination checkout before running fo reconcile RUN.');
@@ -1664,7 +1880,56 @@ function cmdReconcile(args) {
     try { process.kill(operation.pid, 0); } catch (e) { if (e.code === 'ESRCH') return; }
     throw new OrchError('OPERATION_ACTIVE', `process ${operation.pid} may still own this operation`);
   };
-  c.store.transact((state) => {
+  const outcome = c.store.transact((state) => {
+    if (args.flags['review-dispatch-id']) {
+      if (id === 'RUN') throw new OrchError('BAD_ARGUMENTS', 'review reconciliation needs a task id');
+      const t = sm.getTask(state, id);
+      const dispatchId = needFlag(args, 'review-dispatch-id');
+      const liveness = needFlag(args, 'liveness');
+      if (!['active', 'unknown', 'failed'].includes(liveness)) throw new OrchError('BAD_ARGUMENTS', '--liveness must be active, unknown, or failed');
+      const dispatch = (t.review_dispatches || []).find((d) => d.id === dispatchId);
+      if (!dispatch || (dispatch.task_id && dispatch.task_id !== id)) {
+        throw new OrchError('INVALID_REVIEW_DISPATCH', 'review dispatch is not owned by this task');
+      }
+      const status = reviewDispatchStatus(dispatch);
+      const agent = args.flags['agent-id'] ? String(args.flags['agent-id']) : dispatch.agent_id;
+      const author = sm.lastAttempt(t);
+      if ((dispatch.agent_id && agent !== dispatch.agent_id) || (agent &&
+          (author?.agent_id === agent || (t.review_dispatches || []).some((d) => d !== dispatch && d.agent_id === agent)))) {
+        throw new OrchError('INVALID_REVIEW_DISPATCH', 'reviewer identity is changed, reused, or belongs to the author');
+      }
+      if (['abandoned', 'superseded'].includes(status) && args.flags.abandon) {
+        return { review: true, dispatch: dispatchId, status, unchanged: true };
+      }
+      if (['completed', 'abandoned', 'superseded'].includes(status)) {
+        throw new OrchError('REVIEW_TERMINAL', `review ${dispatchId} is ${status}; its history cannot be reopened`);
+      }
+      if (t.state !== 'REVIEWING' || dispatch.cycle !== t.verify_cycle || dispatch.attempt !== author?.attempt_id) {
+        throw new OrchError('WRONG_STATE', `${id}: this dispatch does not belong to the current review cycle and attempt`);
+      }
+      if ((liveness === 'active' && args.flags.abandon) || (status === 'active' && liveness === 'unknown')) {
+        throw new OrchError('REVIEW_ACTIVE', `review ${dispatchId} is confirmed active; record an explicit failed host result before retiring it`);
+      }
+      if (status === 'failed' && liveness !== 'failed') {
+        throw new OrchError('REVIEW_TERMINAL', 'a failed dispatch cannot be reopened; request a replacement');
+      }
+      if (liveness === 'active' && !agent) throw new OrchError('BAD_ARGUMENTS', 'confirmed active reviews require --agent-id from the host');
+      dispatch.status = status;
+      if (agent) dispatch.agent_id = agent;
+      setReviewDispatchStatus(dispatch, liveness, reason);
+      dispatch.liveness = { status: liveness, at: nowIso(), reason, source: 'operator host observation' };
+      if (args.flags.abandon) {
+        setReviewDispatchStatus(dispatch, 'abandoned', reason);
+        dispatch.abandoned_at = nowIso();
+        dispatch.abandonment_reason = reason;
+      }
+      sm.emit(state, { type: 'review_reconciled', task: id, dispatch: dispatchId,
+        attempt: dispatch.attempt, agent_id: dispatch.agent_id, liveness, status: reviewDispatchStatus(dispatch), reason });
+      return { review: true, dispatch: dispatchId, status: reviewDispatchStatus(dispatch) };
+    }
+    if (args.flags.abandon || args.flags.liveness || args.flags['agent-id']) {
+      throw new OrchError('BAD_ARGUMENTS', 'review recovery options require --review-dispatch-id');
+    }
     if (id === 'RUN') {
       if (!state.delivery_operation) throw new OrchError('WRONG_STATE', 'no interrupted delivery is recorded');
       confirmStopped(state.delivery_operation);
@@ -1683,12 +1948,18 @@ function cmdReconcile(args) {
         delete t.integration_operation;
         sm.transition(state, id, 'APPROVED', { recovery: true, reason });
       } else {
-        throw new OrchError('WRONG_STATE', `${id}: no interrupted verification or integration is recorded`);
+        throw new OrchError('WRONG_STATE', `${id}: no interrupted verification or integration is recorded${t.state === 'REVIEWING' ? '; review recovery requires --review-dispatch-id, --liveness, and --reason' : ''}`);
       }
     }
     sm.emit(state, { type: 'operation_reconciled', task: id, reason });
   });
-  console.log(`${id}: interrupted operation reconciled`);
+  if (outcome?.review) {
+    const retired = ['failed', 'abandoned', 'superseded'].includes(outcome.status);
+    console.log(`${id}: review ${outcome.dispatch} is ${outcome.status}${outcome.unchanged ? ' (already reconciled; unchanged)' : ''}.`);
+    console.log(retired
+      ? `Late reports from this dispatch are rejected. A replacement must independently review the verified candidate: fo review-package ${id}`
+      : `No replacement is permitted. Check host status; unknown liveness requires an explicit --abandon decision.`);
+  } else console.log(`${id}: interrupted operation reconciled`);
 }
 
 function cmdRecover(args) {
@@ -1782,7 +2053,8 @@ function cmdSelfCheck(args) {
   const add = (ok, what, detail) => rows.push({ ok, what, detail: detail || '' });
   const major = Number(process.versions.node.split('.')[0]);
   add(major >= 18, `node ${process.versions.node}`, major >= 18 ? '' : 'Node 18 or newer is required');
-  add(gitops.available() ? true : null, 'git', gitops.available() ? gitops.git(root, ['--version']).out : 'not found: runs use the shared workspace fallback');
+  try { gitops.requireWorktreeSupport(root); add(true, 'git worktree compatibility', gitops.git(root, ['--version']).out); }
+  catch (e) { add(null, 'git worktree compatibility', e.message); }
   for (const f of ['SKILL.md', 'config.default.yaml', 'templates/task-contract.yaml', 'templates/execution-report.yaml', 'templates/review-report.yaml', 'templates/correction-request.yaml']) {
     add(fs.existsSync(path.join(SKILL_DIR, f)), `skill file ${f}`);
   }
@@ -1827,6 +2099,7 @@ function cmdHelp() {
     '  block|unblock|fail|cancel|reopen|escalate|authorize|amend   task management (each needs --reason)',
     '  decision "text" | observe --category C --text T | learn',
     '  status [--json] | resume | reconcile ID --reason R | recover | final-report | runs | self-check | go | parse-args',
+    '  reconcile ID --review-dispatch-id UUID --liveness active|unknown|failed [--agent-id HOST_ID] [--abandon] --reason R',
   ].join('\n'));
 }
 

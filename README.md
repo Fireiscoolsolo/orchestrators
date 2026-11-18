@@ -2,8 +2,8 @@
 
 | Project | Status |
 | --- | --- |
-| [Fable Orchestrator](fable-orchestrator/README.md) | Experimental V1.1 candidate |
+| [Fable Orchestrator](fable-orchestrator/README.md) | Experimental v1.1.0 candidate, unpublished |
 | Opus Orchestrator | Planned for `opus-orchestrator/` |
 | Sonnet Orchestrator | Planned for `sonnet-orchestrator/` |
 
-Each orchestrator has an independent install and test entry point in its project directory.
+Each orchestrator installs independently from its own directory. See the [candidate validation report](fable-orchestrator/VALIDATION.md), [security boundaries](fable-orchestrator/SECURITY.md), and [remaining limitations](fable-orchestrator/LIMITATIONS.md). No open-source license has been selected or applied.
