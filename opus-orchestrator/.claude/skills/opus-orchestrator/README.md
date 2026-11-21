@@ -2,7 +2,7 @@
 
 A Claude Code skill that turns one request with several objectives into task specifications, runs them through Haiku-first worker subagents in dependency order (in parallel where the scopes do not overlap), verifies and reviews every result, and keeps Opus as architect and final approver. The rules that matter are enforced by a command line, `oo`, not by prose: it owns the task state machine, routing, scheduling, verification runs, git integration, budgets and the persisted state.
 
-Version 2.0.0. Read "Verification status" and "Limitations" before relying on it: only one live Claude Code run has been made, and several parts have never run against real agents.
+Version 1.0.0. Read "Verification status" and "Limitations" before relying on it: only one live Claude Code run has been made, and several parts have never run against real agents.
 
 ## Contents
 

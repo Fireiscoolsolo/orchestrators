@@ -69,8 +69,8 @@ function setup() {
   for (const f of fs.readdirSync(path.join(REAL_SKILL, 'config'))) {
     if (f.endsWith('.yaml')) fs.copyFileSync(path.join(REAL_SKILL, 'config', f), path.join(skillDir, 'config', f));
   }
-  fs.writeFileSync(path.join(skillDir, 'VERSION'), '2.0.0\n');
-  fs.writeFileSync(path.join(skillDir, 'CHANGELOG.md'), '# Changelog\n\n## 2.0.0 - 2026-11-14\n\n- Initial release.\n');
+  fs.writeFileSync(path.join(skillDir, 'VERSION'), '1.0.0\n');
+  fs.writeFileSync(path.join(skillDir, 'CHANGELOG.md'), '# Changelog\n\n## 1.0.0 - 2026-11-14\n\n- Initial release.\n');
   const paths = store.resolvePaths({ projectDir: path.join(root, 'project'), stateDir: path.join(root, 'state') });
   store.ensureState(paths);
   return { root, skillDir, paths, done: () => fs.rmSync(root, { recursive: true, force: true }) };
@@ -424,7 +424,7 @@ test('setProposalStatus requires the user for approval; applyProposal refuses un
 
     // nothing in the skill copy changed
     assert.ok(fs.readFileSync(path.join(s.skillDir, 'config', 'routing.yaml')).equals(original));
-    assert.equal(fs.readFileSync(path.join(s.skillDir, 'VERSION'), 'utf8'), '2.0.0\n');
+    assert.equal(fs.readFileSync(path.join(s.skillDir, 'VERSION'), 'utf8'), '1.0.0\n');
     assert.equal(fs.existsSync(path.join(s.skillDir, 'history')), false);
   } finally {
     s.done();
@@ -444,10 +444,10 @@ test('applyProposal backs up, changes exactly one key, bumps VERSION and logs; r
     imp.saveProposal(s.paths, p);
     imp.setProposalStatus(s.paths, p.id, 'approved', { by: 'user', now: NOW });
     const r = imp.applyProposal(s.paths, s.skillDir, p.id, NOW);
-    assert.deepEqual(r, { changed_file: 'config/routing.yaml', backup: 'history/2.0.0/config/routing.yaml', version: '2.0.1', previous_version: '2.0.0' });
+    assert.deepEqual(r, { changed_file: 'config/routing.yaml', backup: 'history/1.0.0/config/routing.yaml', version: '2.0.1', previous_version: '1.0.0' });
 
     // backup under history/<old version>/ is the original, byte for byte
-    const backup = path.join(s.skillDir, 'history', '2.0.0', 'config', 'routing.yaml');
+    const backup = path.join(s.skillDir, 'history', '1.0.0', 'config', 'routing.yaml');
     assert.ok(fs.readFileSync(backup).equals(original));
 
     // exactly the named key changed
@@ -479,7 +479,7 @@ test('applyProposal backs up, changes exactly one key, bumps VERSION and logs; r
     const applied = imp.loadProposal(s.paths, p.id);
     assert.equal(applied.status, 'applied');
     assert.equal(applied.applied.previous_value, 1.5);
-    assert.equal(applied.applied.backup, 'history/2.0.0/config/routing.yaml');
+    assert.equal(applied.applied.backup, 'history/1.0.0/config/routing.yaml');
     assert.throws(() => imp.applyProposal(s.paths, s.skillDir, p.id, NOW), (e) => e.code === 'NOT_APPROVED');
 
     // rollback
@@ -525,7 +525,7 @@ test('applyProposal re-checks the proposal and refuses a target outside config/'
     fs.writeFileSync(path.join(s.paths.proposalsDir, `${p.id}.yaml`), yaml.stringify(p));
     assert.throws(() => imp.applyProposal(s.paths, s.skillDir, p.id, NOW), (e) => e.code === 'BAD_TARGET' || e.code === 'INVALID_PROPOSAL');
     assert.equal(fs.readFileSync(path.join(s.skillDir, 'SKILL.md'), 'utf8'), 'routing:\n  x: 1\n');
-    assert.equal(fs.readFileSync(path.join(s.skillDir, 'VERSION'), 'utf8'), '2.0.0\n');
+    assert.equal(fs.readFileSync(path.join(s.skillDir, 'VERSION'), 'utf8'), '1.0.0\n');
   } finally {
     s.done();
   }

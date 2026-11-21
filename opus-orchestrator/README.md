@@ -1,6 +1,6 @@
 # Opus Orchestrator
 
-Version 2.0.0, published as an experimental prerelease in the Orchestrators collection.
+Version 1.0.0, published as an experimental prerelease in the Orchestrators collection.
 
 See the [installation instructions, usage, verification status, and limitations](.claude/skills/opus-orchestrator/README.md). The skill directory contains its scripts, five agent definitions, configuration, templates, tests, and deterministic demonstration fixtures.
 

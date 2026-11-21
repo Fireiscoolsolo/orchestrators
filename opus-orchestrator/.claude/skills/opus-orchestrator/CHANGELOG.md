@@ -2,7 +2,7 @@
 
 Improvement proposals that you approve and apply add their own entries below, with the change, the rationale, the evidence and the rollback command.
 
-## 2.0.0 - 2026-11-16
+## 1.0.0 - 2026-11-16
 
 First release of the skill.
 
@@ -20,7 +20,7 @@ Added
 - Tests and demonstration: 439 automated tests (`scripts/run_tests.cjs`), the simulated-agent demonstration `scripts/demo.cjs` (shared and `--git`), and the recorded live Claude Code run in `validation/live/`.
 - Documentation: `README.md` and `references/` (architecture, routing, execution, verification and recovery policies, capability audit).
 
-Changed during the 2.0.0 hardening, after the live run
+Changed during the 1.0.0 hardening, after the live run
 
 - Unknown backslash escapes in double-quoted YAML strings are kept literally instead of being refused.
 - Worker and reviewer packages ask for single-quoted strings and forward slashes. An unparsable report is refused with the line number and an instruction to resend it.
