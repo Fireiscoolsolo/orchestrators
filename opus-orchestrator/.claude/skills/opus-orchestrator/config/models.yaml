@@ -1,0 +1,20 @@
+# Model settings. Only the aliases haiku, sonnet and opus are accepted; any other
+# name (for example an invented identifier) is rejected by validation.
+models:
+  # Model that plans, reviews and integrates. One of haiku, sonnet, opus.
+  orchestrator: opus
+  # Model used for workers unless routing picks another one.
+  worker_default: haiku
+  # Model used when a task is escalated after repeated failure.
+  escalation: opus
+  # The list of accepted model aliases. Do not add names that are not real aliases.
+  allowed:
+    - haiku
+    - sonnet
+    - opus
+  # relative_cost values are unitless planning weights you may edit. They are NOT prices
+  # and are never shown as money; they only rank models when comparing expected cost.
+  relative_cost:
+    haiku: 1
+    sonnet: 3
+    opus: 5

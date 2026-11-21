@@ -1,0 +1,12 @@
+# Context and compaction settings.
+context:
+  # aggressive targets 0.40 utilization, balanced 0.60, custom uses target_utilization.
+  mode: balanced
+  # Fraction of the context window to stay under (strictly between 0 and 1); used when mode is custom.
+  target_utilization: 0.60
+  # Whether a checkpoint is written before the context is compacted.
+  checkpoint_before_compaction: true
+  # Maximum number of lines in the resume summary printed after compaction.
+  max_resume_lines: 120
+  # Ignore a recorded context utilization reading older than this many seconds.
+  utilization_max_age_seconds: 600

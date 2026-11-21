@@ -1,0 +1,10 @@
+# Review report from an independent reviewer (synthetic values)
+task_id: DEMO-001
+reviewer: opus-reviewer      # or "orchestrator"
+verdict: request_changes     # approve|request_changes|reject
+criteria:                    # exactly one entry per acceptance criterion, in order
+  - {met: true, evidence: 'tests/greet.test.js:5 covers the named case; ran it, exit 0'}
+  - {met: false, evidence: 'no test for an empty name in tests/greet.test.js'}
+findings:                    # non-empty unless verdict is approve; severity: blocker|major|minor|note
+  - {severity: major, file: tests/greet.test.js, description: 'empty-name case is not tested'}
+checks: {}                   # optional extra answers

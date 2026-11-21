@@ -1,0 +1,79 @@
+# Four task specifications for the demonstration project (see demo/project).
+# SLUG-001 and WORD-001 are independent and have disjoint scopes; SUM-001 needs both;
+# DOC-001 documents the result and needs SUM-001.
+- task_id: SLUG-001
+  title: Implement slugify
+  objective: Implement slugify(text) in src/slugify.js so that it turns a title into a URL slug.
+  kind: implementation
+  complexity: 5
+  dependencies: []
+  authorized_files: [src/slugify.js]
+  acceptance_criteria:
+    - slugify returns the text in lower case with words joined by single dashes
+    - runs of spaces and punctuation become one dash
+    - accents are removed, so Crème becomes creme
+    - the slug has no leading or trailing dash
+    - an empty text, or a text without letters or digits, gives an empty string
+    - the tests in test/slugify.test.js pass
+  verification:
+    - run test/slugify.test.js and read any failure
+  verification_commands:
+    - node --test test/slugify.test.js
+    - node --test acceptance/slugify.acceptance.test.js
+  context: src/slugify.js is a stub that throws. Do not edit the tests. The project has no dependencies and no install step.
+  constraints: [no new dependencies, edit only src/slugify.js]
+
+- task_id: WORD-001
+  title: Implement wordcount
+  objective: Implement wordcount(text) in src/wordcount.js so that it returns the number of words in a text.
+  kind: implementation
+  complexity: 2
+  dependencies: []
+  authorized_files: [src/wordcount.js]
+  acceptance_criteria:
+    - words are separated by any run of whitespace, including tabs and newlines
+    - leading and trailing whitespace is ignored
+    - an empty or blank text gives 0
+    - punctuation attached to a word belongs to that word
+    - the tests in test/wordcount.test.js pass
+  verification:
+    - run the test file named below
+  verification_commands:
+    - node --test test/wordcount.test.js
+  context: src/wordcount.js is a stub that throws. Do not edit the tests. The project has no dependencies.
+  constraints: [no new dependencies, edit only src/wordcount.js]
+
+- task_id: SUM-001
+  title: Add summarize
+  objective: Create src/summary.js exporting summarize(text), which returns the slug and the word count of a text, using slugify and wordcount.
+  kind: implementation
+  complexity: 3
+  dependencies: [SLUG-001, WORD-001]
+  authorized_files: [src/summary.js]
+  acceptance_criteria:
+    - summarize(text) returns an object with the keys slug and words
+    - slug comes from slugify and words comes from wordcount, both applied to the original text
+    - the tests in test/summary.test.js pass
+  verification:
+    - run the test file named below
+  verification_commands:
+    - node --test test/summary.test.js
+  context: src/slugify.js and src/wordcount.js are implemented by the tasks this one depends on. src/summary.js does not exist yet.
+  constraints: [no new dependencies, edit only src/summary.js]
+
+- task_id: DOC-001
+  title: Document the API in the README
+  objective: Replace the placeholder in the API section of README.md with documentation of slugify, wordcount and summarize.
+  kind: documentation
+  complexity: 2
+  dependencies: [SUM-001]
+  authorized_files: [README.md]
+  acceptance_criteria:
+    - the API section of README.md describes slugify(text), wordcount(text) and summarize(text), each with a short example
+    - the placeholder sentence is gone
+  verification:
+    - read the finished README
+  verification_commands:
+    - node -e "const t=require('fs').readFileSync('README.md','utf8');process.exit(t.includes('slugify(')&&t.includes('wordcount(')&&t.includes('summarize(')&&!t.includes('has not been written')?0:1)"
+  context: The three functions are implemented in src/. Describe what they do, not how.
+  constraints: [edit only README.md]

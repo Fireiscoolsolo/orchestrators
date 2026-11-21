@@ -1,0 +1,41 @@
+# Verification policy per mode.
+verification:
+  # Shell command run for regression checks, or null for none.
+  regression_command: null
+  # Each mode has: max_parallel (cap on workers, null = no cap), independent_review
+  # (min_complexity and the risks that trigger a separate reviewer), regression
+  # (never, risky or always), final_audit (whole-run audit at the end), and
+  # reviewers_high_risk (number of independent reviewers for high-risk tasks).
+  modes:
+    fast:
+      max_parallel: 3
+      independent_review:
+        min_complexity: 11
+        risks: [high]
+      regression: never
+      final_audit: false
+      reviewers_high_risk: 1
+    balanced:
+      max_parallel: null
+      independent_review:
+        min_complexity: 5
+        risks: [high]
+      regression: risky
+      final_audit: false
+      reviewers_high_risk: 1
+    thorough:
+      max_parallel: null
+      independent_review:
+        min_complexity: 3
+        risks: [medium, high]
+      regression: always
+      final_audit: true
+      reviewers_high_risk: 1
+    maximum:
+      max_parallel: null
+      independent_review:
+        min_complexity: 1
+        risks: [low, medium, high]
+      regression: always
+      final_audit: true
+      reviewers_high_risk: 2

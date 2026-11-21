@@ -1,0 +1,20 @@
+# Run checkpoint written by oo (synthetic values)
+run_id: 20261114-100000-abcd         # run identifier
+written_at: 2026-11-14T10:05:00.000Z # ISO-8601 UTC
+objective: Add a greeting function   # run objective
+options: {mode: balanced, max_workers: 5, max_review_rounds: 3, max_retries: 2, plan_only: false}   # run options
+phase: executing                     # current phase
+spec_revisions: {DEMO-001: 1}        # spec revision per task
+task_graph: {DEMO-001: [], DEMO-002: [DEMO-001]}   # dependencies per task
+task_statuses: {DEMO-001: RUNNING, DEMO-002: PENDING}   # status per task
+active_agents:                       # workers currently dispatched
+  - {task_id: DEMO-001, role: implementation-worker, agent: opus-implementer, model: haiku, since: "2026-11-14T10:01:00.000Z"}
+decisions: [Use shared workspace]    # decisions recorded so far
+modified_files: [src/greet.js]       # files changed so far
+verification_evidence: {DEMO-001: {passed: true, commands: 1}}   # per task
+known_failures:                      # failures to remember
+  - {task_id: DEMO-002, kind: timeout, reason: worker exceeded the command timeout}
+pending_corrections:                 # open correction requests
+  - {task_id: DEMO-002, round: 1, failure: test fails, required_change: handle empty name}
+next_actions: ["oo review DEMO-001 (awaiting Opus quality gate)"]   # what to do next
+usage: {agent_calls: 2, tokens_total: 12000, tokens_measured: false}   # usage so far

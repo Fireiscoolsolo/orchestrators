@@ -1,0 +1,13 @@
+# Improvement proposal saved in STATE/proposals/<id>.yaml (synthetic values)
+id: IMP-20261114-001             # proposal id
+created: 2026-11-14T10:00:00.000Z   # ISO-8601 UTC
+category: routing_heuristics     # task_decomposition|agent_instructions|specification_precision|verification_rules|routing_heuristics|context_overhead|recovery_behavior|troubleshooting_procedure
+title: Raise expected attempts for the example band   # short title
+rationale: Example only; the observed first-pass rate was low.   # why
+evidence: ["example run: 1 of 6 first-pass at complexity 5-6"]   # non-empty
+target_file: config/routing.yaml # relative to the skill directory
+change: {kind: config_set, key: routing.heuristic_expected_attempts.haiku.5-6, value: 2.0}   # kind: config_set|manual
+risk: low                        # low|medium|high
+status: proposed                 # proposed|approved|rejected|applied|rolled_back
+approved_by: null                # "user" once approved
+weakens_safety: false            # must be false

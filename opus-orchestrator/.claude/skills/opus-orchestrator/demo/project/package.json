@@ -1,0 +1,9 @@
+{
+  "name": "text-tools-demo",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Tiny dependency-free fixture project for the opus-orchestrator demonstration",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
+}

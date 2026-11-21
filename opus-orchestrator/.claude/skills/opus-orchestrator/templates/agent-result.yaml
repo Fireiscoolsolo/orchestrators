@@ -1,0 +1,14 @@
+# Agent result: fenced yaml block at the end of a worker's final message (synthetic values)
+task_id: DEMO-001
+status: completed            # completed|failed|blocked|needs_decomposition
+summary: Added greet() and one test file.   # one or two sentences
+files_changed: [src/greet.js, tests/greet.test.js]   # paths touched
+self_check:                  # one entry per acceptance criterion, in order (required when completed)
+  - met: true                # criterion met?
+    evidence: 'test "greets by name" passes'   # what you saw; single-quoted, paths with forward slashes
+commands_run:                # commands you ran
+  - {command: 'node --test tests/greet.test.js', exit_code: 0}
+commit: null                 # commit sha when working in a git worktree
+branch: null                 # branch name in a worktree
+issues: []                   # things the orchestrator must know, incl. denied tools
+proposed_subtasks: []        # only with needs_decomposition

@@ -1,0 +1,27 @@
+# Task specification written by the orchestrator (all values are synthetic examples)
+task_id: DEMO-001                # ID, pattern ^[A-Z][A-Z0-9]*-\d{3}$
+title: Add greeting function     # short title
+objective: Add a greet(name) function that returns a greeting string.   # result wanted
+kind: implementation             # implementation|research|test|verification|review|debug|documentation|integration|security|repository
+priority: medium                 # low|medium|high|critical
+complexity: 3                    # 1-10, or give complexity_factors instead
+complexity_factors: {technical_difficulty: 1, components: 1, architectural_impact: 0, ambiguity: 0, security_sensitivity: 0, dependency_complexity: 0, regression_risk: 1, debugging_difficulty: 0}   # each 0-3
+risk: low                        # low|medium|high
+dependencies: []                 # task ids that must be COMPLETED first
+assigned_model: auto             # auto|haiku|sonnet|opus; an explicit model is a floor
+assigned_role: auto              # auto or a logical role
+authorized_files: [src/greet.js, tests/greet.test.js]   # files, dirs (trailing slash) or globs
+acceptance_criteria:             # observable statements
+  - greet("Ada") returns "Hello, Ada!"
+  - a test covers an empty name
+deliverables: [src/greet.js]     # optional
+verification:                    # what the worker does before reporting
+  - run the test file
+verification_commands:           # run by oo itself; exit 0 = pass
+  - node --test tests/greet.test.js
+context: The project has no other source files.   # what the worker cannot find quickly
+constraints: [no new dependencies]   # optional
+tool_permissions: []             # tools needed beyond the agent default
+security_sensitive: false        # true raises risk
+side_effects: none               # none|local|external
+exclusive: false                 # true = runs alone

@@ -1,0 +1,13 @@
+# Budget limits. A null limit means no limit was set by this skill. It never overrides
+# or lifts limits imposed by your account or provider.
+budget:
+  # Whether budget tracking is active.
+  enabled: true
+  # Maximum tokens for a run, or null for no limit set here.
+  token_limit: null
+  # Maximum cost in US dollars for a run, or null for no limit set here.
+  cost_limit_usd: null
+  # Maximum number of agent calls for a run, or null for no limit set here.
+  agent_call_limit: null
+  # Percent (1-100) of a limit at which a warning is raised.
+  warning_threshold_percent: 80

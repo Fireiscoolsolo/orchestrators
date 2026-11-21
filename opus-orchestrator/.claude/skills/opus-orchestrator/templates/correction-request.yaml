@@ -1,0 +1,10 @@
+# Correction request sent back to a worker (synthetic values)
+task_id: DEMO-001
+failure: node --test tests/greet.test.js exits 1   # exact failure
+evidence: "tests/greet.test.js:9 expected 'Hello, friend!' got 'Hello, !'"   # command output, file:line
+expected_behavior: greet("") returns "Hello, friend!"   # what should happen
+required_change: default an empty name to "friend" in greet()   # the one change needed
+scope: [src/greet.js]        # subset of authorized_files
+verification: [node --test tests/greet.test.js]   # commands to re-run
+verification_commands: ['node --test tests/greet.test.js']   # shell commands oo verify runs in this round besides the task's own; include one that fails before the fix and passes after it
+strategy_change: Fix the default in greet() instead of the test.   # required from the second round on

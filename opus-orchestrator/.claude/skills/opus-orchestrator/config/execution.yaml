@@ -1,0 +1,41 @@
+# Execution settings. Project overrides go in .claude/opus-orchestrator/config.yaml.
+execution:
+  # Run mode: fast, balanced, thorough or maximum. Controls verification depth and the parallel cap.
+  mode: balanced
+  # Maximum number of workers running at the same time (integer 1-20). Fast mode caps this at 3.
+  max_workers: 5
+  # Maximum review rounds per task before it is escalated (integer 0-10).
+  max_review_rounds: 3
+  # Maximum retries per task after a failure (integer 0-10).
+  max_retries: 2
+  # Whether independent tasks may run in parallel.
+  parallel_execution: true
+  # Whether run state is written to disk after each change so a run can be resumed.
+  persistent_checkpoints: true
+  # Whether a result is checked by running commands independently instead of trusting worker claims.
+  independent_verification: true
+  # Workspace isolation for writing workers: auto, worktree or none.
+  isolation: auto
+  # Timeout in seconds for each verification command.
+  command_timeout_seconds: 600
+
+improvement:
+  # Whether outcomes are recorded as observations for later routing decisions.
+  collect_observations: true
+  # Must stay false: the skill never modifies its own core files automatically. Validation rejects true.
+  auto_modify_core_skill: false
+  # Minimum number of samples before a proposal may be made from observations.
+  min_samples: 5
+
+security:
+  # Extra regular expressions that mark a shell command as unsafe, added to the built-in list.
+  extra_unsafe_patterns: []
+  # Glob patterns of files workers must never read, write or print.
+  protected_paths:
+    - ".env"
+    - ".env.*"
+    - "*.pem"
+    - "*.key"
+    - "id_rsa*"
+    - "*credentials*"
+    - "*secret*"
