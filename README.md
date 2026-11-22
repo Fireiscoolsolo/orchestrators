@@ -1,5 +1,7 @@
 # Orchestrators
 
+**Latest release:** [Orchestrators 2026.11.22: Fable 1.2.0 and Opus 1.1.0](https://github.com/Fireiscoolsolo/orchestrators/releases/tag/orchestrators-2026.11.22). It has one zip with both projects and a zip for each project, each with a SHA-256 checksum.
+
 | Project | Status |
 | --- | --- |
 | [Fable Orchestrator](fable-orchestrator/README.md) | Experimental v1.2.0 |
