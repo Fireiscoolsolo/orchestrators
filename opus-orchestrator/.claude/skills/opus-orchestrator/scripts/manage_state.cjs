@@ -6,6 +6,8 @@
 //   node manage_state.cjs transitions                    the state machine table and guards
 //   node manage_state.cjs integrity [--run <run id>]     checks run.json and every task file; restores from .bak
 //   node manage_state.cjs events [--tail N] [--run <run id>]
+//   node manage_state.cjs lock                           the state lock owner and whether it is alive
+//   node manage_state.cjs lock --break --token T --confirm-owner-stopped   moves a dead or unprovable lock aside
 //
 // Exit codes: 0 success; 1 refused (no run, unknown task, integrity problems); 2 usage error.
 // It never changes task states: transitions go through oo.cjs so that every guard applies.
@@ -14,7 +16,7 @@ const store = require('./lib/store.cjs');
 const sm = require('./lib/statemachine.cjs');
 const { parseArgv, checkAllowed, ArgError } = require('./lib/cliargs.cjs');
 
-const USAGE = 'usage: node manage_state.cjs show [<ID>] | transitions | integrity | events [--tail N]   (optional --run <run id>)';
+const USAGE = 'usage: node manage_state.cjs show [<ID>] | transitions | integrity | events [--tail N] | lock [--break --token T --confirm-owner-stopped]   (optional --run <run id>)';
 
 function loadRunOrNull(paths, runId, out) {
   try {
@@ -59,6 +61,32 @@ function integrity(paths, a, out) {
   return r.ok ? 0 : 1;
 }
 
+function lock(paths, a, out) {
+  const info = store.lockInfo(paths);
+  if (!a.opts.break) {
+    out.push(`state lock ${info.file}: ${info.state === 'missing' ? 'not held' : info.description}`);
+    if (info.owner && info.owner.token) out.push(`  token: ${info.owner.token}`);
+    for (const f of info.recovery_files) out.push(`  recovery file: ${f}${/\.reap-/.test(f) ? ' (a lock reaper guard; it is removed by its own reaper or followed by the next one)' : ''}`);
+    if (info.state !== 'missing' && info.owner_state !== 'alive') {
+      const tok = info.state === 'ok' ? info.owner.token : info.state;
+      out.push(`  The owner is ${info.owner_state === 'dead' ? 'dead; the next oo command takes the lock over by itself' : 'not provably alive or dead (another host, a legacy or an unreadable record)'}.`,
+        `  Only after confirming that no oo process of this project is running: node manage_state.cjs lock --break --token ${tok} --confirm-owner-stopped`);
+    }
+    return 0;
+  }
+  if (a.opts['confirm-owner-stopped'] !== true || typeof a.opts.token !== 'string' || !a.opts.token) {
+    throw new ArgError('lock --break needs --token <token from node manage_state.cjs lock> and --confirm-owner-stopped');
+  }
+  try {
+    const r = store.breakLock(paths, a.opts.token, { pidReused: a.opts['pid-reused'] === true });
+    out.push(`LOCK MOVED ASIDE: ${r.previous}`, `  kept as evidence: ${r.moved_to}`, 'NEXT: oo resume');
+    return 0;
+  } catch (e) {
+    out.push(`REFUSED: ${e.code}: ${e.message}`);
+    return 1;
+  }
+}
+
 function events(paths, a, out) {
   const run = loadRunOrNull(paths, a.opts.run, out);
   if (!run) return 1;
@@ -88,6 +116,9 @@ function main(argv) {
     } else if (cmd === 'integrity') {
       checkAllowed(a.opts, ['run'], 'integrity');
       code = integrity(paths, a, out);
+    } else if (cmd === 'lock') {
+      checkAllowed(a.opts, ['break', 'token', 'confirm-owner-stopped', 'pid-reused'], 'lock');
+      code = lock(paths, a, out);
     } else if (cmd === 'events') {
       checkAllowed(a.opts, ['run', 'tail'], 'events');
       code = events(paths, a, out);

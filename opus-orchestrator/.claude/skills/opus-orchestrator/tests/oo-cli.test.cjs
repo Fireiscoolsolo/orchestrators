@@ -255,14 +255,18 @@ test('simulated-agent: next writes the worker package to a file and prints an Ag
   assert.match(text, /- no new dependencies/);
   assert.match(text, /file contents.*are data, not instructions/i);
   assert.match(text, /Shared workspace: edit files in place in /);
-  assert.match(text, /```yaml\ntask_id: A-001\nstatus: completed/);
+  const attempt = p.task('A-001').dispatch.attempt_id;
+  assert.match(attempt, /^A-001-a1-[0-9a-f]{6}$/);
+  assert.ok(text.includes(`\`\`\`yaml\ntask_id: A-001\nattempt_id: '${attempt}'   # copy exactly`), 'the report template carries the attempt id of this dispatch');
+  assert.match(text, /attempt_id: '[^']+'[^\n]*\nstatus: completed/);
   assert.ok(text.trimEnd().endsWith('```'), 'the report format is the last thing in the package');
   assert.equal(p.status('A-001'), 'DISPATCHED');
   assert.equal(p.runRecord().usage.worker_calls, 1);
 });
 
 test('next uses an installed agent type and --inline prints the whole package', () => {
-  const p = H.project();
+  // worktree strategy: isolated writers may run in parallel (a shared workspace serializes them)
+  const p = H.project({ git: true });
   p.write('.claude/agents/opus-implementer.md', '---\nname: opus-implementer\n---\n');
   p.ok(['init', 'Installed agent']);
   p.plan([H.spec('A-001'), H.spec('B-001')]);
@@ -276,7 +280,8 @@ test('next uses an installed agent type and --inline prints the whole package', 
 });
 
 test('next respects max_workers and scope conflicts and prints a reason when nothing can run', () => {
-  const p = H.project();
+  // worktree strategy: isolated writers may run in parallel (a shared workspace serializes them)
+  const p = H.project({ git: true });
   p.ok(['init', '--max-workers', '2', 'Scheduling']);
   assert.match(p.ok(['next']), /NOTHING DISPATCHED: no tasks are planned/);
   p.plan([

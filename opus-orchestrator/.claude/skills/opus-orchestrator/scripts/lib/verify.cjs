@@ -184,7 +184,36 @@ function tailLines(text, n) {
   return lines.slice(-n).join('\n');
 }
 
-function runOne(command, sh, cwd, timeoutMs) {
+// ---------------------------------------------------------------------------
+// Command environment
+// ---------------------------------------------------------------------------
+
+// Variables that commonly hold credentials. A verification command needs the project's tools,
+// not the user's cloud, registry or model-provider credentials, so these are removed from its
+// environment unless the configuration lists the name in security.command_env_allow. This is a
+// limited safeguard: a command can still read credential files the user can read.
+const SECRET_ENV_RE = /(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|APIKEY|API_KEY|ACCESS_KEY|ACCESS_KEY_ID|SECRET_KEY|PRIVATE_KEY|CREDENTIALS?|AUTH|AUTH_TOKEN|SESSION_TOKEN|CLIENT_SECRET|COOKIE|WEBHOOK|SAS)(?:_|$)/i;
+const SECRET_ENV_NAMES = new Set(['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GH_TOKEN', 'GITHUB_TOKEN', 'NPM_TOKEN', 'NODE_AUTH_TOKEN',
+  'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AZURE_CLIENT_SECRET', 'GOOGLE_APPLICATION_CREDENTIALS',
+  'CLAUDE_CODE_OAUTH_TOKEN', 'HF_TOKEN', 'DOCKER_PASSWORD', 'PYPI_TOKEN', 'TWINE_PASSWORD', 'CARGO_REGISTRY_TOKEN', 'SSH_AUTH_SOCK']);
+
+/** {env, removed: [names]}: the environment for verification commands. */
+function commandEnv(base, allow) {
+  const allowed = new Set((Array.isArray(allow) ? allow : []).map(String));
+  const env = {};
+  const removed = [];
+  for (const [k, v] of Object.entries(base || process.env)) {
+    if (!allowed.has(k) && (SECRET_ENV_NAMES.has(k.toUpperCase()) || SECRET_ENV_RE.test(k))) {
+      removed.push(k);
+      continue;
+    }
+    env[k] = v;
+  }
+  env.GIT_TERMINAL_PROMPT = '0';
+  return { env, removed: removed.sort() };
+}
+
+function runOne(command, sh, cwd, timeoutMs, env) {
   const verbatim = shellKind(sh.shell) === 'cmd';
   const args = sh.args.concat(verbatim ? [`"${command}"`] : [command]);
   const input = JSON.stringify({ shell: sh.shell, args, cwd, timeout_ms: timeoutMs, max_bytes: MAX_CAPTURE_BYTES, verbatim });
@@ -195,6 +224,7 @@ function runOne(command, sh, cwd, timeoutMs) {
     windowsHide: true,
     maxBuffer: MAX_CAPTURE_BYTES * 8,
     timeout: timeoutMs + RUNNER_GRACE_MS,
+    env,
   });
   const entry = { command, exit_code: null, duration_ms: Date.now() - t0, timed_out: false, refused: false, reason: null, output_tail: '' };
   let data = null;
@@ -224,20 +254,23 @@ function runOne(command, sh, cwd, timeoutMs) {
 }
 
 function commandPassed(c) {
-  return c.refused !== true && c.timed_out !== true && c.exit_code === 0;
+  return c.refused !== true && c.timed_out !== true && c.skipped !== true && c.exit_code === 0;
 }
 
 /**
- * Runs each command (after a safety check) in `cwd` through findShell().
+ * Runs each command (after a safety check) in `cwd` through findShell(), with credential-like
+ * environment variables removed (see commandEnv). With stopOnFailure, the commands after the
+ * first one that fails are not run and are listed with skipped: true.
  * @param {string[]} commands
- * @param {{cwd?: string, timeout_ms?: number, extraUnsafe?: Array<string|RegExp>}} opts
- * @returns {{passed: boolean|null, shell: string|null, commands: Array<{command, exit_code, duration_ms, timed_out, refused, reason, output_tail}>}}
+ * @param {{cwd?: string, timeout_ms?: number, extraUnsafe?: Array<string|RegExp>, envAllow?: string[], stopOnFailure?: boolean}} opts
+ * @returns {{passed: boolean|null, shell: string|null, env_removed: string[], commands: Array<{command, exit_code, duration_ms, timed_out, refused, skipped, reason, output_tail}>}}
  */
-function runCommands(commands, { cwd = process.cwd(), timeout_ms = DEFAULT_TIMEOUT_MS, extraUnsafe = [] } = {}) {
+function runCommands(commands, { cwd = process.cwd(), timeout_ms = DEFAULT_TIMEOUT_MS, extraUnsafe = [], envAllow = [], stopOnFailure = false } = {}) {
   const list = Array.isArray(commands) ? commands : commands == null ? [] : [commands];
-  if (list.length === 0) return { passed: null, shell: null, commands: [] };
+  if (list.length === 0) return { passed: null, shell: null, env_removed: [], commands: [] };
   const timeoutMs = Number.isFinite(timeout_ms) && timeout_ms > 0 ? Math.floor(timeout_ms) : DEFAULT_TIMEOUT_MS;
   const sh = findShell();
+  const { env, removed } = commandEnv(process.env, envAllow);
   const cwdOk = (() => {
     try {
       return fs.statSync(cwd).isDirectory();
@@ -246,7 +279,20 @@ function runCommands(commands, { cwd = process.cwd(), timeout_ms = DEFAULT_TIMEO
     }
   })();
   const results = [];
+  let failed = false;
   for (const command of list) {
+    if (failed && stopOnFailure) {
+      results.push({ command: security.redactSecrets(String(command)), exit_code: null, duration_ms: 0, timed_out: false, refused: false, skipped: true,
+        reason: 'not run: an earlier command failed', output_tail: '' });
+      continue;
+    }
+    const before = results.length;
+    runListed(command);
+    if (!commandPassed(results[before])) failed = true;
+  }
+  return { passed: results.every(commandPassed), shell: sh.shell, env_removed: removed, commands: results };
+
+  function runListed(command) {
     const safety = security.checkCommandSafety(command, extraUnsafe);
     if (!safety.safe) {
       results.push({
@@ -258,18 +304,17 @@ function runCommands(commands, { cwd = process.cwd(), timeout_ms = DEFAULT_TIMEO
         reason: `refused: ${safety.reason}`,
         output_tail: '',
       });
-      continue;
+      return;
     }
     if (!cwdOk) {
       results.push({ command: security.redactSecrets(command), exit_code: null, duration_ms: 0, timed_out: false, refused: false,
         reason: `working directory does not exist: ${cwd}`, output_tail: '' });
-      continue;
+      return;
     }
-    const entry = runOne(command, sh, cwd, timeoutMs);
+    const entry = runOne(command, sh, cwd, timeoutMs, env);
     entry.command = security.redactSecrets(command);
     results.push(entry);
   }
-  return { passed: results.every(commandPassed), shell: sh.shell, commands: results };
 }
 
 // ---------------------------------------------------------------------------
@@ -293,7 +338,8 @@ function verdict({ commandsResult = null, checks = [], scope = null } = {}) {
   const manual = Array.isArray(checks) ? checks : [];
 
   for (const c of cmds) {
-    if (c.refused) reasons.push(`command refused: ${c.command} (${c.reason || 'unsafe'})`);
+    if (c.skipped) reasons.push(`command not run (an earlier command failed): ${c.command}`);
+    else if (c.refused) reasons.push(`command refused: ${c.command} (${c.reason || 'unsafe'})`);
     else if (c.timed_out) reasons.push(`command timed out: ${c.command}`);
     else if (c.exit_code !== 0) reasons.push(`command failed (exit ${c.exit_code === null ? 'none' : c.exit_code}): ${c.command}`);
   }
@@ -320,6 +366,7 @@ function verdict({ commandsResult = null, checks = [], scope = null } = {}) {
 
 module.exports = {
   findShell,
+  commandEnv,
   runCommands,
   checkScope,
   verdict,

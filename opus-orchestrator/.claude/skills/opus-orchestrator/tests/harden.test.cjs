@@ -25,7 +25,7 @@ test('simulated-agent: a report with Windows paths and regular expressions in do
   p.write('a-001.txt', 'A\n');
   const report = [
     'Done.', '', '```yaml',
-    'task_id: A-001', 'status: completed', 'summary: "wrote C:\\Users\\ExampleUser\\proj\\a-001.txt"',
+    'task_id: A-001', "attempt_id: '__CURRENT_ATTEMPT__'", 'status: completed', 'summary: "wrote C:\\Users\\dev\\proj\\a-001.txt"',
     'files_changed: ["a-001.txt"]', 'self_check:',
     '  - met: true', '    evidence: "regex ^\\S+\\d{3}$ matched in D:\\src\\check.js"',
     'commands_run:', '  - {command: "node D:\\src\\check.js", exit_code: 0}',
@@ -33,7 +33,7 @@ test('simulated-agent: a report with Windows paths and regular expressions in do
   const out = p.ok(['result', 'A-001', '--stdin'], { input: report });
   assert.match(out, /RESULT ACCEPTED: A-001 -> IMPLEMENTED/);
   const t = p.task('A-001');
-  assert.equal(t.result.summary, 'wrote C:\\Users\\ExampleUser\\proj\\a-001.txt');
+  assert.equal(t.result.summary, 'wrote C:\\Users\\dev\\proj\\a-001.txt');
   assert.equal(t.evidence.self_check[0].evidence, 'regex ^\\S+\\d{3}$ matched in D:\\src\\check.js');
 });
 
@@ -157,19 +157,21 @@ test('simulated-agent: a file reported by absolute path is listed once, project-
   p.plan([H.spec('A-001', { authorized_files: ['src/'], verification_commands: [H.existsCmd('src/a.txt')] }), H.spec('B-001')]);
   p.ok(['next']);
   p.write('src/a.txt', 'A\n');
-  p.write('b-001.txt', 'B\n');
   const fwd = p.dir.split(path.sep).join('/');
   // the worker reports the file by its absolute Windows-style path (backslashes, drive letter in other case)
   const winAbs = `${p.dir.split(path.sep).join('\\')}\\src\\a.txt`;
   const lowerDrive = /^[A-Za-z]:/.test(winAbs) ? winAbs[0].toLowerCase() + winAbs.slice(1) : winAbs;
   const files = [lowerDrive, 'src/a.txt', `${fwd}/src/a.txt`, 'C:/elsewhere/other.txt'];
-  const block = ['```yaml', 'task_id: A-001', 'status: completed', "summary: 'wrote src/a.txt'", 'files_changed:',
+  const block = ['```yaml', 'task_id: A-001', "attempt_id: '__CURRENT_ATTEMPT__'", 'status: completed', "summary: 'wrote src/a.txt'", 'files_changed:',
     ...files.map((f) => `  - '${f}'`), 'self_check:', "  - met: true", "    evidence: 'file exists'", '```', ''].join('\n');
   p.ok(['result', 'A-001', '--stdin'], { input: block });
   assert.deepEqual(p.task('A-001').result.files_changed, ['src/a.txt', 'C:/elsewhere/other.txt']);
+  p.ok(['verify', 'A-001']);
+  // shared workspace: B runs after A's verification closed A's evidence window
+  p.ok(['next']);
+  p.write('b-001.txt', 'B\n');
   p.ok(['result', 'B-001', '--stdin'], { input: H.report('B-001', { files: [`${fwd}/b-001.txt`] }) });
   assert.deepEqual(p.task('B-001').result.files_changed, ['b-001.txt']);
-  p.ok(['verify', 'A-001']);
   p.ok(['verify', 'B-001']);
   const out = p.ok(['final-report']);
   const section = out.split('## Files modified')[1].split('## Commands executed')[0];
@@ -209,7 +211,16 @@ test('simulated-agent: the worktree of a self-implemented task lies under the in
   assert.match(out, /RESULT ACCEPTED: O-001 -> IMPLEMENTED/);
   out = p.ok(['verify', 'O-001']);
   assert.match(out, /VERIFICATION PASSED: O-001/);
-  assert.equal(path.resolve(p.dir, p.task('O-001').evidence.verification.workspace), path.resolve(dir));
+  // the pinned commit of the self worktree is verified in a clean checkout owned by oo, which is removed afterwards
+  const sha = H.g(dir, 'rev-parse', 'HEAD');
+  const v = p.task('O-001').evidence.verification;
+  assert.equal(v.candidate.commit, sha);
+  assert.equal(v.candidate.kind, 'commit');
+  const checkout = path.resolve(p.dir, v.workspace);
+  assert.ok(checkout.startsWith(path.join(p.runDir(), 'worktrees', 'verify-O-001-')), checkout);
+  assert.match(out, /clean checkout .*verify-O-001-[0-9a-f]{6}: removed/);
+  assert.ok(!fs.existsSync(checkout), 'the clean checkout was removed');
+  assert.equal(p.task('O-001').binding.worktree.split('/').pop(), 'O-001-d1', 'the self worktree is bound to the attempt');
   p.ok(['review-package', 'O-001']);
   p.ok(['review', 'O-001', '--stdin'], { input: H.review('O-001', { reviewer: 'opus-reviewer' }) });
   out = p.ok(['review', 'O-001', '--stdin', '--integrate'], { input: H.review('O-001') });
@@ -294,12 +305,15 @@ test('simulated-agent: approval of a high-risk task needs as many approving inde
   assert.match(p.checkpoint().next_actions[0], /^oo review-package H-001 \(independent review required: 2 approving reviews for a high-risk task, 1 so far/);
   let out = p.refused(['review', 'H-001', '--stdin'], { input: H.review('H-001') });
   assert.match(out, /approval of H-001 refused; task state unchanged/);
-  assert.match(out, /requires 2 approving independent reviews in the current round \(round 0\); 1 recorded/);
+  assert.match(out, /requires 2 approving independent reviews from distinct reviewer agents in the current round \(round 0\); 1 recorded/);
   assert.match(out, /NEXT: oo review-package H-001, launch the next reviewer/);
   assert.equal(p.status('H-001'), 'REVIEWING');
   assert.equal(p.task('H-001').evidence.reviews.length, 1, 'the refused approval was not stored');
 
   p.ok(['review-package', 'H-001']);
+  // the same reviewer agent reporting again is not a second independent review
+  out = p.refused(['review', 'H-001', '--stdin', '--agent-id', 'sim-reviewer-1'], { input: H.review('H-001', { reviewer: 'opus-reviewer' }) });
+  assert.match(out, /agent sim-reviewer-1 already recorded review H-001-r1-[0-9a-f]{6} in this round/);
   out = p.ok(['review', 'H-001', '--stdin'], { input: H.review('H-001', { reviewer: 'opus-reviewer' }) });
   assert.match(out, /NEXT: oo review H-001 --stdin with your own review/);
   assert.match(p.ok(['review', 'H-001', '--stdin'], { input: H.review('H-001') }), /APPROVED: H-001 -> APPROVED/);
@@ -327,8 +341,9 @@ test('simulated-agent: oo learn run twice for the same run records its observati
   p.plan([H.spec('A-001'), H.spec('B-001', { verification_commands: [H.FAIL_CMD] })]);
   p.ok(['next']);
   p.write('a-001.txt', 'A\n');
-  p.write('b-001.txt', 'B\n');
   p.ok(['result', 'A-001', '--stdin', '--verify'], { input: H.report('A-001', { files: ['a-001.txt'] }) });
+  p.ok(['next']); // shared workspace: B after A's verification
+  p.write('b-001.txt', 'B\n');
   p.ok(['result', 'B-001', '--stdin'], { input: H.report('B-001', { files: ['b-001.txt'] }) });
   p.refused(['verify', 'B-001']);
   const lines = () => fs.readFileSync(p.paths.observationsFile, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));

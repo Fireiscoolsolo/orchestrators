@@ -222,6 +222,7 @@ function writeCheckpointFor(ctx) {
 
 /** Saves changed tasks and the run, appends events and rewrites checkpoint.yaml. */
 function persist(ctx, commandEvent) {
+  store.assertLockHeld(ctx.paths); // a write without the lock (or after losing it) is refused
   for (const id of ctx.dirty) store.saveTask(ctx.paths, ctx.run.run_id, ctx.byId.get(id));
   updatePhase(ctx);
   store.saveRun(ctx.paths, ctx.run);
@@ -233,7 +234,7 @@ function persist(ctx, commandEvent) {
 }
 
 function locked(env, fn) {
-  return store.withLock(env.paths, fn);
+  return store.withLock(env.paths, fn, { command: env.command || null });
 }
 
 function limits(ctx) {
@@ -469,6 +470,249 @@ function sideEffectAuth(ctx, t) {
 }
 
 // ---------------------------------------------------------------------------
+// Operation identities, attempts, candidates and integrity checks
+// ---------------------------------------------------------------------------
+
+/**
+ * A slow operation (verification, integration, delivery) runs its commands outside the state lock.
+ * Its record {kind, id, pid, host, acquired_at, ...} is written under the lock before the commands
+ * start, and the result is applied only if the record still carries the same id afterwards: a
+ * result of a superseded or taken-over operation is discarded, never merged into newer state.
+ */
+function newOp(kind, extra) {
+  const o = store.newOwner(kind);
+  return Object.assign(o, { id: o.token }, extra || {});
+}
+
+/**
+ * Checks an existing operation record before a new one starts. A live owner blocks; a dead owner
+ * (same host, process gone) is taken over; an owner whose liveness cannot be proven blocks unless
+ * the caller names it with --takeover <op id> after checking. A process id the operating system
+ * reused for an unrelated program also looks alive; --takeover <op id> resolves that too. A
+ * takeover is safe for the state: the superseded operation's result is discarded by its id.
+ * Returns a note or null.
+ */
+function opGate(op, what, takeover) {
+  if (!op) return null;
+  const st = store.ownerState(op);
+  if (st === 'alive' && takeover !== op.id) {
+    refuse(`${what} not started`, `${op.kind} ${op.id} is already running in process ${op.pid} on this host (since ${op.acquired_at})`,
+      `wait for it to finish, then oo status; if that process id now belongs to an unrelated program (the oo process is gone), repeat with --takeover ${op.id}`);
+  }
+  if (st === 'unknown' && takeover !== op.id) {
+    refuse(`${what} not started`, `${op.kind} ${op.id} was started by process ${op.pid} on host ${op.host} at ${op.acquired_at}, and oo cannot tell whether it still runs`,
+      `confirm that process is gone, then repeat with --takeover ${op.id}`);
+  }
+  return `took over the interrupted ${op.kind} ${op.id} of process ${op.pid} (${st === 'dead' ? 'it no longer runs' : 'confirmed by --takeover'})`;
+}
+
+function attemptIdFor(t) {
+  return `${t.task_id}-a${t.attempts}-${require('node:crypto').randomBytes(3).toString('hex')}`;
+}
+
+/** Closes the current attempt if it is still open (a block, cancel or failure of an in-flight task). */
+function closeAttempt(t, outcome, ts, reason) {
+  const cur = t.dispatch && t.dispatch.attempt_id;
+  if (!cur) return;
+  const e = (t.attempt_log || []).find((x) => x.attempt_id === cur);
+  if (e && e.outcome === 'open') logAttempt(t, cur, outcome === 'blocked' || outcome === 'cancelled' || outcome === 'failed' ? 'abandoned' : outcome, ts, { reason: reason || outcome });
+}
+
+function logAttempt(t, attemptId, outcome, ts, extra) {
+  t.attempt_log = (t.attempt_log || []).map((e) => (e.attempt_id === attemptId ? Object.assign({}, e, { outcome, closed_at: ts }, extra || {}) : e));
+}
+
+/** Why a report naming `attemptId` is not the current in-flight attempt, or null when it is. */
+function attemptMismatch(t, attemptId) {
+  const cur = t.dispatch && t.dispatch.attempt_id;
+  if (attemptId && cur && attemptId === cur && sm.IN_FLIGHT.includes(t.status)) return null;
+  const known = (t.attempt_log || []).find((e) => e.attempt_id === attemptId);
+  if (!attemptId) return `the report has no attempt_id; the current attempt of ${t.task_id} is ${cur || 'none'} (copy attempt_id from the report block of the task package)`;
+  if (known && known.outcome === 'abandoned') return `attempt ${attemptId} was abandoned at ${known.closed_at} (${known.reason || 'reconciled'}); a late report of an abandoned attempt is never applied`;
+  if (known && known.outcome && known.outcome !== 'open') return `attempt ${attemptId} is already closed (${known.outcome} at ${known.closed_at}); a duplicate or late report is not applied`;
+  if (!known) return `attempt ${attemptId} was never dispatched for ${t.task_id}`;
+  return `attempt ${attemptId} is not the current attempt of ${t.task_id} (current: ${cur || 'none'}, status ${t.status})`;
+}
+
+function generated(ctx) {
+  return workspace.generatedPolicy(ctx.cfg);
+}
+
+function setupCommands(ctx) {
+  const s = ctx.cfg.verification && ctx.cfg.verification.setup_commands;
+  return Array.isArray(s) ? s.filter((x) => typeof x === 'string' && x.trim()) : [];
+}
+
+function commandOpts(ctx) {
+  return {
+    timeout: (Number(ctx.cfg.execution.command_timeout_seconds) || 600) * 1000,
+    extraUnsafe: (ctx.cfg.security && ctx.cfg.security.extra_unsafe_patterns) || [],
+    envAllow: (ctx.cfg.security && ctx.cfg.security.command_env_allow) || [],
+  };
+}
+
+/** Repository configuration/hooks guard (worktree strategy): refuses when they changed since init. */
+function checkRepoGuard(ctx, what) {
+  const ws = ctx.run.workspace || {};
+  if (ws.strategy !== 'worktree' || !ws.repo_guard) return;
+  let now;
+  try {
+    now = gitops.repoGuard(ctx.paths.projectDir);
+  } catch (e) {
+    refuse(`${what} not started`, `the repository configuration and hooks cannot be read: ${e.message}`, 'fix the permissions of the .git directory, then repeat');
+  }
+  if (now !== ws.repo_guard) {
+    refuse(`${what} not started`,
+      'the repository configuration, hooks or info/attributes in the git directory changed since the run started; a changed hook, filter or diff driver would run inside oo\'s git operations',
+      'inspect .git/config, .git/hooks and .git/info/attributes; if the user made or approves the change: oo repo-guard --accept --reason <text> --user-authorized');
+  }
+}
+
+/**
+ * Runs setup commands, then commands, stopping at the first failure. Returns the combined
+ * commands result; skipped commands are listed with skipped: true.
+ */
+function runChecked(cwd, setup, cmds, o) {
+  const all = setup.concat(cmds);
+  if (!all.length) return { passed: null, shell: null, commands: [] };
+  const r = verify.runCommands(all, { cwd, timeout_ms: o.timeout, extraUnsafe: o.extraUnsafe, envAllow: o.envAllow, stopOnFailure: true });
+  r.commands.forEach((c, i) => { if (i < setup.length) c.setup = true; });
+  return r;
+}
+
+/**
+ * Changes a command run made in a clean git checkout: [{path, generated}]. Ignored files (the
+ * project's own .gitignore) and paths of the generated-artifact policy are generated artifacts;
+ * anything else invalidates the evidence. Throws when the status cannot be read.
+ */
+function checkoutMutations(dir, policy) {
+  return gitops.statusEntries(dir).map((e) => ({ path: e.path, generated: workspace.isGenerated(e.path, policy) }));
+}
+
+/** A fresh detached checkout of `commit` under the run directory (owned by oo). */
+function cleanCheckout(ctx, purpose, commit) {
+  const dir = path.join(runDir(ctx.env, ctx.run.run_id), 'worktrees', `${purpose}-${require('node:crypto').randomBytes(3).toString('hex')}`);
+  gitops.addDetachedWorktree(ctx.paths.projectDir, dir, commit);
+  return dir;
+}
+
+function dropCheckout(ctx, dir) {
+  if (!dir) return 'none';
+  const r = gitops.removeWorktree(ctx.paths.projectDir, dir);
+  if (r.ok) return 'removed';
+  // One of oo's own clean checkouts whose only changes are generated artifacts (build output,
+  // coverage) holds no evidence and no user work: it is deleted and the registration pruned.
+  // Anything else, and every directory outside oo's own worktrees folder, is kept.
+  const own = gitops.normPath(path.join(runDir(ctx.env, ctx.run.run_id), 'worktrees')) + '/';
+  if (gitops.normPath(dir).startsWith(own) && fs.existsSync(dir)) {
+    try {
+      const entries = gitops.statusEntries(dir);
+      const policy = generated(ctx);
+      if (entries.every((e) => workspace.isGenerated(e.path, policy))) {
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+        gitops.git(['worktree', 'prune'], { cwd: ctx.paths.projectDir });
+        return 'removed (only generated artifacts were in it)';
+      }
+    } catch (_) { /* unreadable: keep it */ }
+  }
+  return `kept (${r.reason})`;
+}
+
+/** Stable digest of a shared candidate's file entries. */
+function filesDigest(files) {
+  const keys = Object.keys(files || {}).sort();
+  return 'sha256:' + require('node:crypto').createHash('sha256').update(JSON.stringify(keys.map((k) => [k, files[k]]))).digest('hex');
+}
+
+/** The identity of a verified candidate, as review dispatches and integration bind to it. */
+function candidateId(c) {
+  if (!c) return null;
+  if (c.kind === 'shared') return `shared:${c.digest}`;
+  return `${c.kind}:${c.commit || '-'}:${c.tree || '-'}`;
+}
+
+/**
+ * Shared workspace: true when every file of the verified candidate still has the recorded content.
+ * Returns {ok, changed:[paths], problem}.
+ */
+function sharedCandidateIntact(ctx, cand) {
+  const changed = [];
+  for (const f of Object.keys((cand && cand.files) || {}).sort()) {
+    const abs = path.join(ctx.paths.projectDir, ...f.split('/'));
+    let now;
+    try {
+      const st = fs.lstatSync(abs);
+      if (st.isSymbolicLink()) now = 'link:' + fs.readlinkSync(abs).split(path.sep).join('/');
+      else if (st.isFile()) now = gitops.hashFile(abs);
+      else now = 'special:' + (st.isDirectory() ? 'directory' : 'other');
+    } catch (e) {
+      if (e.code !== 'ENOENT') return { ok: false, changed: [f], problem: `${f} cannot be read (${e.code})` };
+      now = null;
+    }
+    if (now !== cand.files[f]) changed.push(f);
+  }
+  return { ok: changed.length === 0, changed, problem: null };
+}
+
+/** Shared workspace: another task whose evidence window is open and that writes (or `t` writes). */
+function sharedWindowConflict(ctx, t) {
+  if ((ctx.run.workspace || {}).strategy === 'worktree') return null;
+  const writes = (x) => roleWrites(ctx, x.routing && x.routing.role);
+  return ctx.tasks.find((o) => o.task_id !== t.task_id && workspace.SHARED_WINDOW.includes(o.status) && (writes(o) || writes(t))) || null;
+}
+
+/**
+ * Establishes that `dir` is a worktree the task may own: the root of a work tree of this
+ * repository, not the main checkout, not the integration worktree, not one of oo's own checkouts,
+ * not bound to another task or attempt, and not on the base or integration branch. A report never
+ * establishes ownership; only this check, on a path the orchestrator passes (or oo's own
+ * self-worktree path), does.
+ */
+function bindWorktree(ctx, t, given) {
+  const env = ctx.env;
+  const ws = ctx.run.workspace || {};
+  const dir = path.resolve(String(given));
+  const why = [];
+  if (!fs.existsSync(dir)) why.push(`worktree ${dir} does not exist`);
+  const top = why.length ? null : gitops.topLevel(dir);
+  if (!why.length && (!top || top !== gitops.normPath(dir))) why.push(`${dir} is not the top directory of a git work tree`);
+  if (!why.length && gitops.commonDir(dir) !== gitops.commonDir(ctx.paths.projectDir)) why.push(`${dir} belongs to another repository`);
+  const n = gitops.normPath(dir);
+  if (!why.length && n === gitops.topLevel(ctx.paths.projectDir)) why.push('that is the main checkout, not a worker worktree');
+  if (!why.length && integrationDir(ctx) && n === gitops.normPath(integrationDir(ctx))) why.push('that is the integration worktree');
+  if (!why.length && n.startsWith(gitops.normPath(path.join(runDir(env, ctx.run.run_id), 'worktrees')) + '/')) why.push('that is a checkout owned by oo itself');
+  const selfDir = t.dispatch && t.dispatch.self_worktree ? gitops.normPath(absProject(env, t.dispatch.self_worktree.dir)) : null;
+  if (!why.length && selfDir && n !== selfDir) why.push(`work the orchestrator does itself must be in its own worktree ${absProject(env, t.dispatch.self_worktree.dir)}`);
+  if (!why.length) {
+    const other = ctx.tasks.find((o) => o.binding && gitops.normPath(absProject(env, o.binding.worktree)) === n && !(o.task_id === t.task_id && o.binding.attempt_id === t.dispatch.attempt_id));
+    if (other) why.push(`that worktree is already bound to ${other.task_id} attempt ${other.binding.attempt_id}`);
+  }
+  let branch = null;
+  if (!why.length) {
+    const b = gitops.git(['symbolic-ref', '--short', '-q', 'HEAD'], { cwd: dir });
+    branch = b.code === 0 ? b.stdout.trim() : null;
+    if (branch && (branch === ws.base_branch || branch === ws.integration_branch)) why.push(`the worktree is on ${branch}, a branch oo delivers to or integrates on`);
+    if (selfDir && branch !== t.dispatch.self_worktree.branch) why.push(`the worktree is on ${branch || 'a detached HEAD'}, not on ${t.dispatch.self_worktree.branch}`);
+    const ops = gitops.operationsInProgress(dir);
+    if (ops.length) why.push(`a git operation is unfinished in the worktree: ${ops.join(', ')}`);
+  }
+  return { dir, branch, problems: why };
+}
+
+/** Commits on the integration branch between `from` and `to` that oo did not create (merges recorded in task evidence). */
+function foreignIntegrationCommits(ctx, from, to) {
+  if (!from || !to || from === to) return [];
+  const r = gitops.git(['rev-list', '--first-parent', `${from}..${to}`], { cwd: ctx.paths.projectDir });
+  if (r.code !== 0) return [`(cannot list commits ${from.slice(0, 12)}..${to.slice(0, 12)}: ${r.stderr.trim()})`];
+  const known = new Set();
+  for (const x of ctx.tasks) {
+    const ev = x.evidence || {};
+    for (const i of [ev.integration].concat((ev.rounds || []).map((rd) => rd && rd.integration))) if (i && i.merged_commit) known.add(i.merged_commit);
+  }
+  return r.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).filter((c) => !known.has(c));
+}
+
+// ---------------------------------------------------------------------------
 // init
 // ---------------------------------------------------------------------------
 
@@ -561,6 +805,12 @@ function cmdInit(env, argv) {
       },
     });
     run.usage = budget.newUsage();
+    const gv = gitops.gitVersion();
+    if (strategy === 'worktree' && !(gv && (gv[0] > 2 || (gv[0] === 2 && gv[1] >= 31)))) {
+      strategy = 'shared';
+      run.workspace.strategy = 'shared';
+      warnings.push(`git ${gv ? gv.join('.') : '(unknown version)'} is older than 2.31, which the worktree checks need; shared workspace strategy`);
+    }
     if (strategy === 'worktree') {
       const dir = path.join(runDir(env, run.run_id), 'worktrees', 'integration');
       try {
@@ -568,6 +818,10 @@ function cmdInit(env, argv) {
         run.workspace.integration_branch = r.branch;
         run.workspace.integration_worktree = relProject(env, dir);
         run.workspace.base_commit = r.base;
+        // The head oo expects on the integration branch; every integration moves it, and any other
+        // movement is detected before the next integration or delivery.
+        run.workspace.integration_head = gitops.revParse(dir, 'HEAD');
+        run.workspace.repo_guard = gitops.repoGuard(projectDir);
       } catch (e) {
         strategy = 'shared';
         run.workspace.strategy = 'shared';
@@ -718,6 +972,7 @@ const DEFER_TEXT = {
   scope_conflict: 'its authorized files overlap a task in progress or one dispatched now',
   exclusive: 'an exclusive task must run alone',
   budget: 'the agent call budget has no calls left for it',
+  shared_serial: 'shared workspace: another task is being worked on, verified or integrated in the same directory, and concurrent changes there cannot be attributed reliably',
 };
 
 function dispatchWorkspace(ctx, t) {
@@ -736,7 +991,9 @@ function dispatchWorkspace(ctx, t) {
     });
   }
   if (roleWrites(ctx, t.routing.role)) return Object.assign(base, { mode: 'isolated', isolated: true, snapshotRoot: null });
-  return Object.assign(base, { mode: 'readonly', isolated: false, snapshotRoot: intDir });
+  // Read-only work reads the integration worktree; its evidence is git's own (the worktree stays
+  // clean and only oo's merges move the branch), not a file snapshot.
+  return Object.assign(base, { mode: 'readonly', isolated: false, snapshotRoot: null });
 }
 
 function depSummaries(ctx, t) {
@@ -748,6 +1005,14 @@ function depSummaries(ctx, t) {
 
 function cmdNext(env, a) {
   cliargs.checkAllowed(a.opts, ['inline'], 'next');
+  // Shared workspace: the baseline snapshot hashes every file, which can take a while, so it is
+  // taken before the state lock. No worker can be editing meanwhile: shared-workspace tasks are
+  // serialized, and a task is only dispatched when no other task's evidence window is open.
+  let preSnap = null;
+  try {
+    const r0 = store.loadRun(env.paths);
+    if (!r0.workspace || r0.workspace.strategy !== 'worktree') preSnap = gitops.snapshot(env.paths.projectDir, { ignore: workspace.snapshotIgnore(env.paths) });
+  } catch (_) { /* no run: openRun refuses below */ }
   return locked(env, () => {
     const ctx = openRun(env);
     if (ctx.run.options.plan_only) {
@@ -770,21 +1035,27 @@ function cmdNext(env, a) {
     });
     const remaining = budget.remainingCalls(ctx.run.usage, ctx.cfg.budget, ctx.run.authorizations);
     const lim = limits(ctx);
+    const shared = (ctx.run.workspace || {}).strategy !== 'worktree';
     const batch = scheduler.selectBatch(schedTasks, {
       max_workers: lim.max_workers,
       parallel: ctx.cfg.execution.parallel_execution !== false,
       call_budget: remaining,
+      shared_serial: shared ? { window: workspace.SHARED_WINDOW, writes: (x) => roleWrites(ctx, x.routing && x.routing.role) } : null,
     });
 
-    let snap = null;
-    const snapshotFor = (root) => {
-      if (snap && snap.root === root) return snap.rel;
-      const data = gitops.snapshot(root, { ignore: workspace.snapshotIgnore(ctx.paths) });
-      const name = `snapshots/dispatch-${ctx.now.replace(/[-:.]/g, '')}-${process.pid}.json`;
+    let snapRel = null;
+    const snapshotFor = () => {
+      if (snapRel) return snapRel;
+      if (!preSnap || !preSnap.complete) {
+        refuse('nothing dispatched: the shared workspace cannot be snapshotted completely',
+          preSnap ? preSnap.errors.map((e) => `${e.path}: ${e.code}`) : ['no snapshot could be taken'],
+          'fix the permissions of the listed paths (or remove them), then oo next; without a complete baseline the scope of shared-workspace work cannot be checked');
+      }
+      const name = `snapshots/baseline-${ctx.now.replace(/[-:.]/g, '')}-${process.pid}.json`;
       const file = path.join(runDir(env, ctx.run.run_id), ...name.split('/'));
-      store.writeJson(file, data);
-      snap = { root, rel: relProject(env, file) };
-      return snap.rel;
+      store.writeJson(file, preSnap);
+      snapRel = relProject(env, file);
+      return snapRel;
     };
 
     const blocks = [];
@@ -798,17 +1069,26 @@ function cmdNext(env, a) {
       const auth = t.side_effects === 'external' ? sideEffectAuth(ctx, t) : null;
       if (auth) auth.used_by_attempt = t.attempts;
       const ws = dispatchWorkspace(ctx, t);
+      const attemptId = attemptIdFor(t);
+      // Shared workspace: the first dispatch records the task's baseline; retries and correction
+      // rounds keep it, so an out-of-scope change of an earlier attempt cannot become baseline.
+      if (ws.snapshotRoot && !(t.baseline && t.baseline.snapshot)) {
+        t.baseline = { snapshot: snapshotFor(), at: ctx.now, attempt_id: attemptId, root: relProject(env, ws.snapshotRoot) };
+      }
       const roleCfg = (ctx.cfg.routing.roles || {})[t.routing.role] || {};
       const text = packages.workerPackage(t, {
-        brief: roleCfg.brief, agent: t.routing.agent, deps: depSummaries(ctx, t), orchestrator: isOrch, workspace: ws,
+        brief: roleCfg.brief, agent: t.routing.agent, deps: depSummaries(ctx, t), orchestrator: isOrch, workspace: ws, attemptId,
       });
       const pkgFile = writeRunFile(env, ctx.run.run_id, `packages/${id}-d${t.attempts}.md`, text);
       t.dispatch = {
-        attempt: t.attempts, at: ctx.now, kind, package: relProject(env, pkgFile), mode: ws.mode, isolated: ws.isolated,
-        integration_head: ws.integrationHead || null, snapshot: ws.snapshotRoot ? snapshotFor(ws.snapshotRoot) : null,
+        attempt: t.attempts, attempt_id: attemptId, at: ctx.now, kind, package: relProject(env, pkgFile), mode: ws.mode, isolated: ws.isolated,
+        integration_head: ws.integrationHead || null, snapshot: ws.snapshotRoot ? t.baseline.snapshot : null,
         snapshot_root: ws.snapshotRoot ? relProject(env, ws.snapshotRoot) : null,
         self_worktree: ws.selfWorktree ? { dir: relProject(env, ws.selfWorktree.dir), branch: ws.selfWorktree.branch } : null,
       };
+      t.binding = null;
+      t.candidate = null;
+      t.attempt_log = (t.attempt_log || []).concat([{ attempt_id: attemptId, attempt: t.attempts, kind, dispatched_at: ctx.now, outcome: 'open' }]);
       blocks.push({ t, ws, pkgFile, text, isOrch });
     }
     ctx.events.push({ type: 'dispatch', tasks: batch.dispatch, deferred: batch.deferred, held });
@@ -926,7 +1206,8 @@ function cmdStarted(env, a) {
 
 /** Records a worker failure on a DISPATCHED/RUNNING task and moves it on. Returns an outcome word. */
 function workerFailure(ctx, t, kind, reason) {
-  t.failures = (t.failures || []).concat([{ kind, reason, ts: ctx.now, attempt: t.attempts || 0 }]);
+  t.failures = (t.failures || []).concat([{ kind, reason, ts: ctx.now, attempt: t.attempts || 0, attempt_id: (t.dispatch && t.dispatch.attempt_id) || null }]);
+  closeAttempt(t, `failed_${kind}`, ctx.now, reason);
   touch(ctx, t);
   if (kind === 'permission' || kind === 'budget' || kind === 'worker_blocked' || kind === 'needs_decomposition') {
     move(ctx, t, 'BLOCKED', { reason, kind });
@@ -969,9 +1250,9 @@ function sayFailureOutcome(env, ctx, id, kind, outcome) {
 }
 
 function cmdWorkerFailed(env, a) {
-  cliargs.checkAllowed(a.opts, ['kind', 'reason'], 'worker-failed');
+  cliargs.checkAllowed(a.opts, ['kind', 'reason', 'attempt'], 'worker-failed');
   const id = a.pos[0];
-  if (!id) usage('worker-failed needs a task id: oo worker-failed <ID> --kind K --reason T');
+  if (!id) usage('worker-failed needs a task id: oo worker-failed <ID> --kind K --reason T [--attempt AID]');
   const kind = a.opts.kind;
   if (!FAILURE_KINDS.includes(kind)) usage(`--kind must be one of ${FAILURE_KINDS.join('|')}`);
   const reason = needReason(a);
@@ -980,6 +1261,10 @@ function cmdWorkerFailed(env, a) {
     const t = getTask(ctx, id);
     if (!sm.IN_FLIGHT.includes(t.status)) {
       refuse(`worker failure for ${id} not recorded`, `${id} is ${t.status}; worker failures apply to DISPATCHED or RUNNING tasks`, 'check oo status; for a finished task use block, fail or cancel');
+    }
+    // With --attempt, a failure notice that belongs to an earlier, superseded attempt is refused.
+    if (a.opts.attempt !== undefined && String(a.opts.attempt) !== (t.dispatch && t.dispatch.attempt_id)) {
+      refuse(`worker failure for ${id} not recorded`, attemptMismatch(t, String(a.opts.attempt)) || `the current attempt is ${t.dispatch && t.dispatch.attempt_id}`, 'a failure of an earlier attempt does not affect the current one');
     }
     const outcome = workerFailure(ctx, t, kind, reason);
     persist(ctx, { command: 'worker-failed', task_id: id, kind, outcome });
@@ -993,7 +1278,7 @@ function cmdWorkerFailed(env, a) {
 // ---------------------------------------------------------------------------
 
 function cmdResult(env, a) {
-  cliargs.checkAllowed(a.opts, ['stdin', 'file', 'tokens', 'worktree', 'branch', 'verify'], 'result');
+  cliargs.checkAllowed(a.opts, ['stdin', 'file', 'tokens', 'worktree', 'branch', 'verify', 'agent-id'], 'result');
   const id = a.pos[0];
   if (!id) usage('result needs a task id: oo result <ID> --stdin');
   let tokens = null;
@@ -1001,73 +1286,97 @@ function cmdResult(env, a) {
     if (!/^\d+$/.test(String(a.opts.tokens))) usage('--tokens must be a non-negative integer');
     tokens = Number(a.opts.tokens);
   }
+  const agentId = a.opts['agent-id'] !== undefined ? String(a.opts['agent-id']).trim() : null;
+  if (agentId !== null && !/^[A-Za-z0-9._:-]{1,128}$/.test(agentId)) usage('--agent-id must be the agent id the host printed (letters, digits, . _ : -)');
   const text = readInput(a);
   let completed = false;
   const code = locked(env, () => {
     const ctx = openRun(env);
     let t = getTask(ctx, id);
     const unchanged = `result for ${id} rejected; task state unchanged`;
+    const failNext = `send the errors back to the worker, or record oo worker-failed ${id} --kind invalid_output --reason <text>`;
     if (t.status === 'CANCELLED') {
       refuse(`result for ${id} refused`, `${id} was cancelled; a late result for a cancelled task is never applied`, 'ignore that worker\'s output; reopen the task only if the user asks (oo reopen <ID> --reason <text> --user-authorized)');
     }
     if (!sm.IN_FLIGHT.includes(t.status)) {
       refuse(`result for ${id} refused`, `${id} is ${t.status}; a worker result is accepted only while the task is DISPATCHED or RUNNING`, firstNext(ctx, 'oo status'));
     }
-    const failNext = `send the errors back to the worker, or record oo worker-failed ${id} --kind invalid_output --reason <text>`;
     const obj = parseReportBlock(text, 'result', id, failNext);
+    const reportedAttempt = obj && typeof obj === 'object' && typeof obj.attempt_id === 'string' ? obj.attempt_id.trim() : null;
+    const mismatch = attemptMismatch(t, reportedAttempt);
+    if (mismatch) {
+      refuse(unchanged, mismatch, `only the report of the current attempt ${t.dispatch && t.dispatch.attempt_id} is accepted; ignore a late or duplicate report`);
+    }
     const v = reports.validateAgentResult(obj, t);
     if (!v.ok) refuse(unchanged, v.errors, failNext);
     const r = v.result;
     const notes = [];
+    const attemptId = t.dispatch.attempt_id;
 
-    let worktree = null;
-    let branch = r.branch || null;
-    let commit = r.commit || null;
+    let binding = null;
+    let candidate = null;
     const ws = ctx.run.workspace || {};
-    if (r.status === 'completed' && ws.strategy === 'worktree' && t.dispatch && t.dispatch.isolated) {
-      const given = a.opts.worktree || (t.dispatch.self_worktree ? absProject(env, t.dispatch.self_worktree.dir) : null);
-      if (!given) {
-        if (commit || r.files_changed.length) {
-          refuse(unchanged, 'worktree strategy: the worker changed files in its own worktree, so oo needs the worktree path to verify them', `repeat with --worktree <path> --branch <branch> taken from the Agent result`);
+    if (r.status === 'completed' && ws.strategy === 'worktree') {
+      const d = t.dispatch || {};
+      if (d.isolated) {
+        const given = a.opts.worktree || (d.self_worktree ? absProject(env, d.self_worktree.dir) : null);
+        if (!given) {
+          if (r.commit || r.files_changed.length) {
+            refuse(unchanged, 'worktree strategy: the worker changed files in its own worktree, so oo needs the worktree path to verify them', 'repeat with --worktree <path> taken from the Agent result (the report itself never names the worktree oo verifies)');
+          }
+          const tree = gitops.treeOf(env.paths.projectDir, d.integration_head);
+          candidate = { kind: 'no_change', attempt_id: attemptId, commit: d.integration_head, tree, base: d.integration_head, integration_head: d.integration_head, recorded_at: ctx.now };
+          notes.push('no worktree given and no change reported: the candidate is the integration head the task was dispatched with, so nothing will be merged for it');
+        } else {
+          const b = bindWorktree(ctx, t, given);
+          if (b.problems.length) refuse(unchanged, b.problems, 'pass the worktree of this attempt with --worktree <path> (from the Agent result)');
+          const sha = gitops.revParse(b.dir, 'HEAD');
+          if (!sha) refuse(unchanged, `${b.dir} has no commit at HEAD`, 'ask the worker to commit its work, or record oo worker-failed');
+          if (r.commit && !sha.startsWith(String(r.commit).toLowerCase())) notes.push(`the reported commit ${r.commit} differs from the worktree HEAD ${sha}; the worktree HEAD is the candidate`);
+          if (a.opts.branch && String(a.opts.branch) !== b.branch) notes.push(`--branch ${a.opts.branch} differs from the worktree's branch ${b.branch || '(detached)'}; the worktree's branch is recorded`);
+          if (r.branch && r.branch !== b.branch) notes.push(`the reported branch ${r.branch} differs from the worktree's branch ${b.branch || '(detached)'}; the report does not decide which branch is used`);
+          let base;
+          try {
+            base = workspace.worktreeChanges(env.paths.projectDir, d.integration_head, sha).base;
+          } catch (e) {
+            refuse(unchanged, e.message, `the worker must start from the integration head ${d.integration_head}; record oo worker-failed ${id} --kind invalid_output --reason <text>`);
+          }
+          binding = { attempt_id: attemptId, worktree: relProject(env, b.dir), branch: b.branch, bound_at: ctx.now };
+          candidate = {
+            kind: 'commit', attempt_id: attemptId, commit: sha, tree: gitops.treeOf(b.dir, sha), base, integration_head: d.integration_head,
+            contains_integration_head: gitops.isAncestor(b.dir, d.integration_head, sha), branch: b.branch, worktree: relProject(env, b.dir), recorded_at: ctx.now,
+          };
         }
-        notes.push('no worktree given and no change reported: the result is verified in the integration worktree');
-      } else {
-        worktree = path.resolve(String(given));
-        if (!fs.existsSync(worktree)) refuse(unchanged, `worktree ${worktree} does not exist`, 'pass the worktree path from the Agent result with --worktree');
-        const head = gitops.git(['rev-parse', 'HEAD'], { cwd: worktree });
-        if (head.code !== 0) refuse(unchanged, `${worktree} is not a git worktree: ${head.stderr.trim()}`, 'pass the worktree path from the Agent result with --worktree');
-        const sha = head.stdout.trim();
-        if (commit && !sha.startsWith(commit)) notes.push(`the reported commit ${commit} differs from the worktree HEAD ${sha}; HEAD is used`);
-        commit = sha;
-        if (a.opts.branch) branch = String(a.opts.branch);
-        if (!branch) {
-          const b = gitops.git(['symbolic-ref', '--short', '-q', 'HEAD'], { cwd: worktree });
-          branch = b.code === 0 ? b.stdout.trim() : null;
-        }
+      } else if (d.mode === 'readonly') {
+        candidate = { kind: 'readonly', attempt_id: attemptId, commit: null, tree: null, integration_head: d.integration_head, recorded_at: ctx.now };
       }
     }
 
-    r.files_changed = relativizeReported(env, r.files_changed, [worktree, t.dispatch && t.dispatch.self_worktree ? absProject(env, t.dispatch.self_worktree.dir) : null]);
+    r.files_changed = relativizeReported(env, r.files_changed, [binding ? absProject(env, binding.worktree) : null, t.dispatch && t.dispatch.self_worktree ? absProject(env, t.dispatch.self_worktree.dir) : null]);
     const reportFile = writeRunFile(env, ctx.run.run_id, `reports/${id}-d${t.attempts || 0}.yaml`, yaml.stringify(r));
     if (tokens !== null) ctx.run.usage = budget.recordTokens(ctx.run.usage, { task_id: id, total: tokens });
     if (t.status === 'DISPATCHED') t = move(ctx, t, 'RUNNING', { reason: 'result received before oo started' });
 
     if (r.status === 'completed') {
-      t = move(ctx, t, 'IMPLEMENTED', { reason: 'worker reported completed' });
+      t = move(ctx, t, 'IMPLEMENTED', { reason: `worker reported completed (attempt ${attemptId})` });
+      t.binding = binding;
+      t.candidate = candidate;
       t.result = {
-        summary: r.summary, files_changed: r.files_changed, commit, branch,
-        worktree: worktree ? relProject(env, worktree) : null, tokens, reported_at: ctx.now,
+        attempt_id: attemptId, agent_id: agentId, summary: r.summary, files_changed: r.files_changed,
+        commit: candidate && candidate.commit ? candidate.commit : null, branch: binding ? binding.branch : null,
+        worktree: binding ? binding.worktree : null, tokens, reported_at: ctx.now,
         report_file: relProject(env, reportFile), issues: r.issues || [], commands_run: r.commands_run || [],
       };
+      logAttempt(t, attemptId, 'reported', ctx.now);
       t.evidence = t.evidence || {};
       t.evidence.self_check = r.self_check;
       t.correction = null;
-      persist(ctx, { command: 'result', task_id: id, status: r.status });
+      persist(ctx, { command: 'result', task_id: id, status: r.status, attempt_id: attemptId });
       completed = true;
       const unmet = (r.self_check || []).map((c, i) => (c.met ? null : i + 1)).filter(Boolean);
-      say(env, `RESULT ACCEPTED: ${id} -> IMPLEMENTED (${oneLine(r.summary, 160)})`);
+      say(env, `RESULT ACCEPTED: ${id} -> IMPLEMENTED (attempt ${attemptId}: ${oneLine(r.summary, 160)})`);
       say(env, `Files reported: ${r.files_changed.length ? r.files_changed.join(', ') : 'none'}`);
-      if (worktree) say(env, `Worktree: ${worktree} | branch ${branch || '?'} | commit ${commit}`);
+      if (binding) say(env, `Worktree bound: ${absProject(env, binding.worktree)} | branch ${binding.branch || '(detached)'} | candidate ${candidate.commit} (tree ${String(candidate.tree).slice(0, 12)})`);
       if (unmet.length) say(env, `Warning: the worker reports criteria ${unmet.join(', ')} as not met`);
       if ((r.issues || []).length) say(env, `Worker issues: ${r.issues.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' | ')}`);
       for (const n of notes) say(env, `Note: ${n}`);
@@ -1083,14 +1392,16 @@ function cmdResult(env, a) {
       t.proposed_subtasks = r.proposed_subtasks;
       touch(ctx, t);
     }
+    logAttempt(t, attemptId, `reported_${r.status}`, ctx.now);
+    touch(ctx, t);
     const outcome = workerFailure(ctx, t, kind, reason);
-    persist(ctx, { command: 'result', task_id: id, status: r.status, outcome });
+    persist(ctx, { command: 'result', task_id: id, status: r.status, outcome, attempt_id: attemptId });
     say(env, `RESULT RECORDED: ${id} reported ${r.status}: ${reason}`);
     if (kind === 'needs_decomposition') say(env, 'Proposed subtasks:', ...indent(yaml.stringify(r.proposed_subtasks).trimEnd()));
     sayFailureOutcome(env, ctx, id, kind, outcome);
     return 0;
   });
-  if (code === 0 && completed && a.opts.verify) return runVerify(env, id);
+  if (code === 0 && completed && a.opts.verify) return runVerify(env, id, {});
   return code;
 }
 
@@ -1106,73 +1417,149 @@ function readSnapshotFile(env, rel) {
   }
 }
 
-/** Where the task's work lives and which files it changed, with the scope verdict. */
-function computeChanges(ctx, t) {
-  const env = ctx.env;
-  const ws = ctx.run.workspace || {};
-  const d = t.dispatch || {};
-  if (ws.strategy === 'worktree' && t.result && t.result.worktree) {
-    const dir = absProject(env, t.result.worktree);
-    if (!fs.existsSync(dir)) {
-      refuse(`verification of ${t.task_id} not started`, `the task's worktree ${dir} no longer exists`, `ask for the work again: oo block ${t.task_id} --reason <text> then oo unblock, or oo fail it`);
-    }
-    const ch = workspace.worktreeChanges(dir, d.integration_head, t.result.commit || 'HEAD');
-    const uncommitted = workspace.uncommittedFiles(dir);
-    const scope = verify.checkScope(ch.files, t.authorized_files || []);
-    return {
-      cwd: dir, files: ch.files, scope: Object.assign(scope, { ignored: [], basis: `git diff ${ch.base ? ch.base.slice(0, 12) : '?'}..${String(t.result.commit).slice(0, 12)}` }),
-      extraChecks: uncommitted.length ? [{ name: 'work committed', result: 'fail', note: `uncommitted changes in the worktree: ${uncommitted.join(', ')}` }] : [],
-      diff: { cwd: dir, base: ch.base, commit: t.result.commit },
-    };
-  }
-  if (ws.strategy === 'worktree' && d.isolated) {
-    return { cwd: integrationDir(ctx), files: [], scope: { ok: true, violations: [], ignored: [], basis: 'no change reported and no worktree' }, extraChecks: [] };
-  }
-  const root = d.snapshot_root ? absProject(env, d.snapshot_root) : ctx.paths.projectDir;
-  const before = d.snapshot ? readSnapshotFile(env, d.snapshot) : null;
-  if (!before) {
-    const files = (t.result && t.result.files_changed) || [];
-    const scope = verify.checkScope(files, t.authorized_files || []);
-    return { cwd: root, files, scope: Object.assign(scope, { ignored: [], basis: 'files reported by the worker (no dispatch snapshot recorded)' }), extraChecks: [] };
-  }
-  const after = gitops.snapshot(root, { ignore: workspace.snapshotIgnore(ctx.paths) });
-  const changed = gitops.diffSnapshot(before, after);
-  const att = workspace.attributeShared(t, changed, ctx.tasks, d.at || '');
-  return {
-    cwd: root, files: att.own.concat(att.violations),
-    scope: { ok: att.ok, violations: att.violations, ignored: att.ignored, basis: 'file snapshot diff since dispatch' },
-    extraChecks: [],
-  };
-}
-
 function commandLines(cmds) {
   const out = [];
   for (const c of cmds || []) {
-    const status = c.refused ? 'refused' : c.timed_out ? 'timed out' : `exit ${c.exit_code === null ? 'none' : c.exit_code}`;
-    out.push(`  [${status}] ${c.command} (${c.duration_ms} ms)${c.reason ? ` - ${c.reason}` : ''}`);
+    const status = c.skipped ? 'not run' : c.refused ? 'refused' : c.timed_out ? 'timed out' : `exit ${c.exit_code === null ? 'none' : c.exit_code}`;
+    out.push(`  [${status}]${c.setup ? ' (setup)' : ''} ${c.command} (${c.duration_ms} ms)${c.reason ? ` - ${c.reason}` : ''}`);
   }
   return out;
 }
 
 function evidenceText(title, info) {
   const L = [title, `Run at: ${info.at}`, `Workspace: ${info.cwd}`, `Shell: ${info.shell || '(no command run)'}`];
+  if (info.candidate) L.push(`Candidate: ${candidateId(info.candidate)}${info.candidate.attempt_id ? ` (attempt ${info.candidate.attempt_id})` : ''}`);
   if (info.basis) L.push(`Scope basis: ${info.basis}`);
+  if ((info.envRemoved || []).length) L.push(`Removed from the command environment (credential-like names): ${info.envRemoved.join(', ')}`);
   if ((info.correctionCommands || []).length) L.push(`Correction-round commands (from the correction request): ${info.correctionCommands.join(' ; ')}`);
   if (info.files) L.push(`Changed files: ${info.files.length ? info.files.join(', ') : 'none'}`);
   if (info.scope) {
     L.push(`Scope: ${info.scope.ok ? 'ok' : `VIOLATIONS: ${info.scope.violations.join(', ')}`}`);
-    for (const g of info.scope.ignored || []) L.push(`Ignored (inside the scope of ${g.owner}, which owned work since this dispatch): ${g.file}`);
+    for (const g of info.scope.ignored || []) L.push(`Attributed elsewhere (${g.basis}): ${g.file}`);
+    for (const g of info.scope.generated || []) L.push(`Generated artifact (not scope evidence): ${g}`);
   }
+  for (const m of info.mutations || []) L.push(`Changed by the commands: ${m.path}${m.generated ? ' (generated artifact, allowed)' : ' (INVALIDATES THE EVIDENCE)'}`);
+  for (const n of info.notes || []) L.push(`Note: ${n}`);
   for (const c of info.checks || []) L.push(`Check ${c.name}: ${c.result}${c.note ? ` (${c.note})` : ''}`);
   for (const c of info.commands || []) {
-    L.push('', `$ ${c.command}`, `exit ${c.exit_code === null ? 'none' : c.exit_code} | ${c.duration_ms} ms${c.timed_out ? ' | timed out' : ''}${c.refused ? ' | refused' : ''}${c.reason ? ` | ${c.reason}` : ''}`);
+    L.push('', `$ ${c.command}${c.setup ? '   (setup)' : ''}`, `exit ${c.exit_code === null ? 'none' : c.exit_code} | ${c.duration_ms} ms${c.timed_out ? ' | timed out' : ''}${c.refused ? ' | refused' : ''}${c.skipped ? ' | not run' : ''}${c.reason ? ` | ${c.reason}` : ''}`);
     if (c.output_tail) L.push(c.output_tail);
   }
   L.push('', `Verdict: ${info.passed ? 'passed' : 'failed'}${info.reasons ? ` - ${info.reasons.join('; ')}` : ''}`);
   return L.join('\n') + '\n';
 }
 
-function runVerify(env, id) {
+/**
+ * Collects, outside the state lock, the evidence of one verification: where the candidate is,
+ * which files it changed and whether they lie in scope, the commands' results in a clean place,
+ * and what the commands changed. Never throws for evidence problems: it returns them as failing
+ * checks (or blocking problems) so that the verification fails closed with a reason.
+ */
+function gatherVerification(ctx, plan) {
+  const env = ctx.env;
+  const out = { cwd: null, files: [], scope: null, extraChecks: [], notes: [], mutations: [], cr: { passed: null, shell: null, commands: [], env_removed: [] }, candidate: null, diff: null, block: null };
+  const policy = generated(ctx);
+  const fail = (name, note) => out.extraChecks.push({ name, result: 'fail', note });
+  if (plan.mode === 'shared') {
+    const root = plan.root;
+    out.cwd = root;
+    const baseline = plan.baseline ? readSnapshotFile(env, plan.baseline) : null;
+    const current = gitops.snapshot(root, { ignore: workspace.snapshotIgnore(ctx.paths) });
+    const cmp = gitops.compareSnapshots(baseline, current);
+    if (!cmp.ok) {
+      out.block = { kind: !baseline || !gitops.isSnapshot(baseline) ? 'evidence_missing' : 'evidence_incomplete', reasons: cmp.problems };
+      return out;
+    }
+    const att = workspace.attributeShared(plan.task, cmp, current, { tasks: ctx.tasks, generated: policy });
+    out.files = att.own.concat(att.violations).sort();
+    out.scope = { ok: att.ok, violations: att.violations, ignored: att.ignored, generated: att.generated, basis: `content-hash snapshot compared with the task baseline of ${plan.baselineAt}` };
+    const files = gitops.pickEntries(current, att.own);
+    out.candidate = { kind: 'shared', attempt_id: plan.attemptId, files, digest: filesDigest(files) };
+    out.cr = runChecked(root, plan.setup, plan.cmds, plan.copts);
+    const post = gitops.snapshot(root, { ignore: workspace.snapshotIgnore(ctx.paths) });
+    const after = gitops.compareSnapshots(current, post);
+    if (!after.ok) fail('commands left the workspace readable', after.problems.join('; '));
+    else out.mutations = after.changed.map((p) => ({ path: p, generated: workspace.isGenerated(p, policy) }));
+    return out;
+  }
+  // Worktree strategy: commands run in a fresh detached checkout of the pinned commit.
+  let commit = null;
+  if (plan.mode === 'commit' || plan.mode === 'no_change') {
+    const c = plan.candidate;
+    commit = c.commit;
+    if (gitops.revParse(ctx.paths.projectDir, commit) !== commit || gitops.treeOf(ctx.paths.projectDir, commit) !== c.tree) {
+      out.block = { kind: 'candidate_missing', reasons: [`the pinned candidate ${commit} (tree ${c.tree}) is no longer in the repository`] };
+      return out;
+    }
+    out.candidate = Object.assign({}, c);
+    if (plan.mode === 'commit') {
+      try {
+        const ch = workspace.worktreeChanges(ctx.paths.projectDir, c.integration_head, commit);
+        out.files = ch.files;
+        const sc = verify.checkScope(ch.files, plan.task.authorized_files || []);
+        out.scope = Object.assign(sc, { ignored: [], generated: [], basis: `git diff ${ch.base.slice(0, 12)}..${commit.slice(0, 12)} (merge base with the dispatch integration head)` });
+        out.diff = { base: ch.base, commit };
+      } catch (e) {
+        out.scope = { ok: false, violations: [], ignored: [], generated: [], basis: `the candidate's changes cannot be listed: ${e.message}` };
+        fail('candidate changes listed', e.message);
+      }
+      const wt = c.worktree ? absProject(env, c.worktree) : null;
+      if (wt && fs.existsSync(wt)) {
+        try {
+          const left = workspace.uncommittedFiles(wt);
+          if (left.length) fail('work committed', `uncommitted changes in the worktree: ${left.join(', ')}`);
+        } catch (e) {
+          fail('work committed', `the worktree status cannot be read (${e.message}); uncommitted work cannot be ruled out`);
+        }
+        const head = gitops.revParse(wt, 'HEAD');
+        if (head && head !== commit) out.notes.push(`the worktree HEAD moved to ${head} after the report; the pinned candidate ${commit} is verified, and a newer commit needs a new attempt`);
+      } else if (wt) {
+        out.notes.push(`the worker worktree ${wt} no longer exists; the pinned candidate commit is verified from the repository`);
+      }
+    } else {
+      out.scope = { ok: true, violations: [], ignored: [], generated: [], basis: 'no change: the candidate is the integration head the task was dispatched with' };
+    }
+  } else if (plan.mode === 'readonly') {
+    const intDir = integrationDir(ctx);
+    commit = gitops.revParse(intDir, 'HEAD');
+    out.candidate = { kind: 'readonly', attempt_id: plan.attemptId, commit, tree: commit ? gitops.treeOf(intDir, commit) : null };
+    const violations = [];
+    try {
+      const dirty = workspace.uncommittedFiles(intDir);
+      violations.push(...dirty);
+      const ops = gitops.operationsInProgress(intDir);
+      if (ops.length) fail('integration worktree untouched', `an unfinished git operation: ${ops.join(', ')}`);
+    } catch (e) {
+      fail('integration worktree untouched', `its status cannot be read: ${e.message}`);
+    }
+    const foreign = foreignIntegrationCommits(ctx, plan.dispatchHead, commit);
+    if (foreign.length) fail('integration branch moved only by oo', `commits not created by oo since the dispatch: ${foreign.join(', ')}`);
+    out.files = violations;
+    out.scope = { ok: violations.length === 0, violations, ignored: [], generated: [], basis: 'read-only task: the integration worktree must stay clean and its branch may move only by oo\'s merges' };
+  }
+  if (!commit) {
+    out.block = { kind: 'candidate_missing', reasons: ['no candidate commit to verify'] };
+    return out;
+  }
+  let dir = null;
+  try {
+    dir = cleanCheckout(ctx, `verify-${plan.task.task_id}`, commit);
+  } catch (e) {
+    out.block = { kind: 'checkout_failed', reasons: [`a clean checkout of ${commit} could not be created: ${e.message}`] };
+    return out;
+  }
+  out.cwd = dir;
+  out.cr = runChecked(dir, plan.setup, plan.cmds, plan.copts);
+  try {
+    out.mutations = checkoutMutations(dir, policy);
+  } catch (e) {
+    fail('commands left the checkout readable', e.message);
+  }
+  out.notes.push(`clean checkout ${relProject(env, dir)}: ${out.mutations.some((m) => !m.generated) ? 'kept as evidence' : dropCheckout(ctx, dir)}`);
+  return out;
+}
+
+function runVerify(env, id, o) {
   const prep = locked(env, () => {
     const ctx = openRun(env);
     let t = getTask(ctx, id);
@@ -1180,6 +1567,8 @@ function runVerify(env, id) {
       const why = `${id} is ${t.status}; verification runs on IMPLEMENTED tasks (or re-runs on VERIFYING)`;
       refuse(`verification of ${id} not started`, why, firstNext(ctx, 'oo status'));
     }
+    const takeoverNote = opGate(t.pending_op, `verification of ${id}`, o.takeover);
+    checkRepoGuard(ctx, `verification of ${id}`);
     const checks = (t.evidence && t.evidence.checks) || [];
     // A correction round may add commands of its own (verification_commands of the correction request).
     const roundNo = t.review_round || 0;
@@ -1190,68 +1579,122 @@ function runVerify(env, id) {
       refuse(`verification of ${id} not started`, `${id} has no verification_commands and no manual check is recorded`,
         `inspect the result yourself and record it with oo check ${id} --name <name> --result pass|fail --note <text>, then oo verify ${id}`);
     }
-    const changes = computeChanges(ctx, t);
-    if (t.status === 'IMPLEMENTED') {
-      t = move(ctx, t, 'VERIFYING', { reason: 'verification started' });
-      persist(ctx, { command: 'verify', task_id: id, phase: 'start' });
+    const ws = ctx.run.workspace || {};
+    const d = t.dispatch || {};
+    let mode;
+    if (ws.strategy !== 'worktree') mode = 'shared';
+    else if (t.candidate && (t.candidate.kind === 'commit' || t.candidate.kind === 'no_change')) mode = t.candidate.kind;
+    else if (d.mode === 'readonly') mode = 'readonly';
+    else {
+      // An isolated task without a recorded candidate: there is no authoritative evidence.
+      t = move(ctx, t, 'BLOCKED', { kind: 'evidence_missing', reason: 'no candidate was recorded for the worker\'s attempt (no bound worktree and no no-change record); its work cannot be verified' });
+      persist(ctx, { command: 'verify', task_id: id, outcome: 'evidence_missing' });
+      return { blocked: true, reasons: [t.block.reason] };
     }
+    if (mode === 'shared' && !(t.baseline && t.baseline.snapshot)) {
+      t = move(ctx, t, 'BLOCKED', { kind: 'evidence_missing', reason: 'no baseline snapshot is recorded for this task; changes since its dispatch cannot be established' });
+      persist(ctx, { command: 'verify', task_id: id, outcome: 'evidence_missing' });
+      return { blocked: true, reasons: [t.block.reason] };
+    }
+    if (t.status === 'IMPLEMENTED') t = move(ctx, t, 'VERIFYING', { reason: 'verification started' });
+    t.pending_op = newOp('verify', { attempt_id: d.attempt_id || null, round: roundNo });
+    if (takeoverNote) t.history.push({ ts: ctx.now, from: t.status, to: t.status, reason: takeoverNote, actor: 'oo' });
+    touch(ctx, t);
+    persist(ctx, { command: 'verify', task_id: id, phase: 'start', op: t.pending_op.id });
     return {
-      cmds, changes, correctionCmds,
-      timeout: (Number(ctx.cfg.execution.command_timeout_seconds) || 600) * 1000,
-      extraUnsafe: (ctx.cfg.security && ctx.cfg.security.extra_unsafe_patterns) || [],
+      opId: t.pending_op.id, attemptId: d.attempt_id || null, mode, cmds, correctionCmds, takeoverNote,
+      plan: {
+        mode, task: structuredClone(t), cmds, setup: setupCommands(ctx), copts: commandOpts(ctx), attemptId: d.attempt_id || null,
+        candidate: t.candidate, root: ctx.paths.projectDir, baseline: t.baseline && t.baseline.snapshot, baselineAt: t.baseline && t.baseline.at,
+        dispatchHead: d.integration_head || null,
+      },
     };
   });
-  const cr = prep.cmds.length
-    ? verify.runCommands(prep.cmds, { cwd: prep.changes.cwd, timeout_ms: prep.timeout, extraUnsafe: prep.extraUnsafe })
-    : { passed: null, shell: null, commands: [] };
+  if (prep.blocked) {
+    say(env, `VERIFICATION NOT POSSIBLE: ${id} -> BLOCKED (kind evidence_missing)`, ...prep.reasons.map((r) => `  - ${r}`),
+      `NEXT: find out what happened to the attempt; then oo unblock ${id} --reason <text> to dispatch it again${(prep.reasons[0] || '').includes('baseline') ? ` (a shared-workspace task without a baseline gets a new one only with oo rebaseline ${id} --reason <text> --user-authorized)` : ''}`);
+    return 1;
+  }
+
+  // Outside the lock: snapshots, clean checkouts and commands. A refreshed view of the tasks is
+  // read for attribution (other tasks' recorded candidates), without holding the lock.
+  let ev;
+  try {
+    const view = openRun(env);
+    ev = gatherVerification(view, prep.plan);
+  } catch (e) {
+    ev = { block: { kind: 'evidence_error', reasons: [e.message] }, cr: { passed: null, shell: null, commands: [], env_removed: [] } };
+  }
 
   return locked(env, () => {
     const ctx = openRun(env);
     let t = getTask(ctx, id);
-    if (t.status !== 'VERIFYING') {
-      refuse(`verification result for ${id} discarded`, `${id} moved to ${t.status} while the commands ran`, firstNext(ctx, 'oo status'));
+    if (t.status !== 'VERIFYING' || !t.pending_op || t.pending_op.id !== prep.opId || (t.dispatch && t.dispatch.attempt_id) !== prep.attemptId) {
+      refuse(`verification result for ${id} discarded`, `the verification ${prep.opId} is no longer current (${id} is ${t.status}${t.pending_op ? `, current operation ${t.pending_op.id}` : ''})`, firstNext(ctx, 'oo status'));
     }
-    const ch = prep.changes;
+    t.pending_op = null;
+    if (ev.block) {
+      const n = (t.verification_runs || 0) + 1;
+      t.verification_runs = n;
+      const evRel = store.writeEvidence(ctx.paths, ctx.run.run_id, `${id}-verify-${n}.txt`, evidenceText(
+        `Verification ${n} of ${id}: evidence could not be established`, { at: ctx.now, cwd: ev.cwd || '(none)', shell: null, passed: false, reasons: ev.block.reasons }));
+      t = move(ctx, t, 'BLOCKED', { kind: ev.block.kind, reason: oneLine(ev.block.reasons.join('; '), 400) });
+      persist(ctx, { command: 'verify', task_id: id, outcome: ev.block.kind });
+      say(env, `VERIFICATION NOT POSSIBLE: ${id} -> BLOCKED (kind ${ev.block.kind})`, ...ev.block.reasons.map((r) => `  - ${r}`), `Evidence: ${absProject(env, evRel)}`,
+        `NEXT: fix the cause; a missing or incomplete snapshot is never treated as "no change". Then oo unblock ${id} --reason <text>${ev.block.kind === 'evidence_missing' ? ` (and, if the baseline itself is gone, oo rebaseline ${id} --reason <text> --user-authorized)` : ''}`);
+      return 1;
+    }
+    const cr = ev.cr;
     const storedChecks = (t.evidence && t.evidence.checks) || [];
-    const allChecks = storedChecks.concat(ch.extraChecks);
-    const v = verify.verdict({ commandsResult: cr, checks: allChecks, scope: ch.scope });
+    const mutated = (ev.mutations || []).filter((m) => !m.generated).map((m) => m.path);
+    const extra = ev.extraChecks.slice();
+    if (mutated.length) extra.push({ name: 'commands left the sources unchanged', result: 'fail', note: `the verification commands changed ${mutated.join(', ')}; evidence produced by commands that rewrite sources is not accepted (add true build outputs to verification.generated_artifacts)` });
+    const allChecks = storedChecks.concat(extra);
+    const v = verify.verdict({ commandsResult: cr, checks: allChecks, scope: ev.scope });
     const n = (t.verification_runs || 0) + 1;
     const evRel = store.writeEvidence(ctx.paths, ctx.run.run_id, `${id}-verify-${n}.txt`, evidenceText(
-      `Verification ${n} of ${id} (round ${t.review_round || 0}, attempt ${t.attempts || 0})`,
-      { at: ctx.now, cwd: ch.cwd, shell: cr.shell, basis: ch.scope.basis, files: ch.files, scope: ch.scope, checks: allChecks, commands: cr.commands, passed: v.passed, reasons: v.reasons, correctionCommands: prep.correctionCmds }));
+      `Verification ${n} of ${id} (round ${t.review_round || 0}, attempt ${prep.attemptId || '?'})`,
+      { at: ctx.now, cwd: ev.cwd, shell: cr.shell, basis: ev.scope.basis, files: ev.files, scope: ev.scope, checks: allChecks, commands: cr.commands, passed: v.passed, reasons: v.reasons,
+        correctionCommands: prep.correctionCmds, candidate: ev.candidate, envRemoved: cr.env_removed, mutations: ev.mutations, notes: ev.notes.concat(prep.takeoverNote ? [prep.takeoverNote] : []) }));
     t.verification_runs = n;
     t.evidence.verification = {
-      passed: v.passed, run_at: ctx.now, shell: cr.shell, workspace: relProject(env, ch.cwd),
-      commands: cr.commands, checks: allChecks, scope: { ok: ch.scope.ok, violations: ch.scope.violations, ignored: ch.scope.ignored || [], basis: ch.scope.basis },
-      changed_files: ch.files, reasons: v.reasons, evidence_file: evRel, correction_commands: prep.correctionCmds,
-      diff: ch.diff ? { cwd: relProject(env, ch.diff.cwd), base: ch.diff.base, commit: ch.diff.commit } : null,
+      passed: v.passed, run_at: ctx.now, shell: cr.shell, workspace: ev.cwd ? relProject(env, ev.cwd) : null, attempt_id: prep.attemptId,
+      commands: cr.commands, checks: allChecks, scope: { ok: ev.scope.ok, violations: ev.scope.violations, ignored: ev.scope.ignored || [], generated: ev.scope.generated || [], basis: ev.scope.basis },
+      changed_files: ev.files, reasons: v.reasons, evidence_file: evRel, correction_commands: prep.correctionCmds,
+      candidate: ev.candidate, candidate_id: candidateId(ev.candidate), mutations: ev.mutations, env_removed: cr.env_removed || [], notes: ev.notes,
+      diff: ev.diff ? { cwd: '.', base: ev.diff.base, commit: ev.diff.commit } : null,
     };
     touch(ctx, t);
     ctx.run.usage = budget.recordVerification(ctx.run.usage, id);
-    if (v.passed) t = move(ctx, t, 'REVIEWING', { reason: 'verification passed' });
+    if (v.passed) t = move(ctx, t, 'REVIEWING', { reason: `verification passed (candidate ${candidateId(ev.candidate)})` });
     else t = move(ctx, t, 'CORRECTION_REQUIRED', { reason: `verification failed: ${v.reasons.join('; ')}` });
     persist(ctx, { command: 'verify', task_id: id, passed: v.passed });
 
     const evAbs = absProject(env, evRel);
     if (v.passed) {
       say(env, `VERIFICATION PASSED: ${id} -> REVIEWING`, ...v.reasons.map((r) => `  ${r}`));
+      say(env, `Candidate: ${candidateId(ev.candidate)}`);
       if (cr.commands.length) say(env, 'Commands:', ...commandLines(cr.commands));
-      say(env, `Changed files: ${ch.files.length ? ch.files.join(', ') : 'none'}`);
-      for (const g of ch.scope.ignored || []) say(env, `Ignored: ${g.file} (inside the scope of ${g.owner}, which owned work since this dispatch)`);
+      say(env, `Changed files: ${ev.files.length ? ev.files.join(', ') : 'none'}`);
+      for (const g of ev.scope.ignored || []) say(env, `Attributed elsewhere: ${g.file} (${g.basis})`);
+      for (const nn of ev.notes) say(env, `Note: ${nn}`);
       say(env, `Evidence: ${evAbs}`);
       const needsIndependent = t.routing && (t.routing.independent_review || t.routing.role === 'orchestrator');
       say(env, needsIndependent
-        ? `NEXT: oo review-package ${id} (an independent review is required), then oo review ${id} --stdin for each review`
+        ? `NEXT: oo review-package ${id} (an independent review is required), then oo review ${id} --stdin --agent-id <id> for each review`
         : `NEXT: oo review ${id} --stdin with your own review (reviewer: orchestrator)`);
       return 0;
     }
     say(env, `VERIFICATION FAILED: ${id} -> CORRECTION_REQUIRED`, ...v.reasons.map((r) => `  - ${r}`));
-    const failing = cr.commands.filter((c) => c.refused || c.timed_out || c.exit_code !== 0);
+    const failing = cr.commands.filter((c) => c.refused || c.timed_out || (!c.skipped && c.exit_code !== 0));
     for (const c of failing) {
-      say(env, `Failing command: ${c.command}`, `Exit code: ${c.refused ? 'refused' : c.timed_out ? 'timed out' : c.exit_code}${c.reason ? ` (${c.reason})` : ''}`, 'Output tail:', ...indent(c.output_tail || '(no output)', '  | '));
+      say(env, `Failing command: ${c.command}${c.setup ? ' (setup)' : ''}`, `Exit code: ${c.refused ? 'refused' : c.timed_out ? 'timed out' : c.exit_code}${c.reason ? ` (${c.reason})` : ''}`, 'Output tail:', ...indent(c.output_tail || '(no output)', '  | '));
     }
-    if (!ch.scope.ok) say(env, `Scope violations (changed outside the authorized files): ${ch.scope.violations.join(', ')}`);
-    for (const g of ch.scope.ignored || []) say(env, `Ignored: ${g.file} (inside the scope of ${g.owner})`);
+    const skipped = cr.commands.filter((c) => c.skipped);
+    if (skipped.length) say(env, `Not run after the failure: ${skipped.map((c) => c.command).join(' ; ')}`);
+    if (!ev.scope.ok) say(env, `Scope violations (changed outside the authorized files, not attributable to another task's recorded content): ${ev.scope.violations.join(', ')}`);
+    for (const g of ev.scope.ignored || []) say(env, `Attributed elsewhere: ${g.file} (${g.basis})`);
+    for (const nn of ev.notes) say(env, `Note: ${nn}`);
     say(env, `Evidence: ${evAbs}`);
     say(env, `NEXT: oo correct ${id} --stdin with a correction request (failure, evidence, expected_behavior, required_change, verification, verification_commands (a command that fails before the fix and passes after it, when one exists)${(t.review_round || 0) >= 1 ? ', strategy_change' : ''})`);
     return 1;
@@ -1259,10 +1702,10 @@ function runVerify(env, id) {
 }
 
 function cmdVerify(env, a) {
-  cliargs.checkAllowed(a.opts, [], 'verify');
+  cliargs.checkAllowed(a.opts, ['takeover'], 'verify');
   const id = a.pos[0];
   if (!id) usage('verify needs a task id: oo verify <ID>');
-  return runVerify(env, id);
+  return runVerify(env, id, { takeover: a.opts.takeover });
 }
 
 function cmdCheck(env, a) {
@@ -1294,13 +1737,56 @@ function cmdCheck(env, a) {
 // reviews
 // ---------------------------------------------------------------------------
 
+/**
+ * Pinned evidence for a reviewer that has no shell: the diff of the verified candidate commit
+ * (worktree strategy) or the verified content of the candidate's files (shared workspace). Files
+ * matching security.protected_paths are listed without their content.
+ */
+function pinnedReviewEvidence(ctx, t, n) {
+  const v = t.evidence.verification || {};
+  const c = v.candidate || {};
+  const protectedPaths = (ctx.cfg.security && ctx.cfg.security.protected_paths) || [];
+  const lines = [`Pinned review evidence for ${t.task_id}, candidate ${candidateId(c)}, verified at ${v.run_at}.`, ''];
+  if (c.kind === 'commit' && v.diff && v.diff.base) {
+    lines.push(`git diff ${v.diff.base} ${c.commit} (no external diff programs, no text conversion), file by file:`, '');
+    let total = 0;
+    for (const f of gitops.changedFiles(ctx.paths.projectDir, v.diff.base, c.commit)) {
+      if (security.isProtectedPath(f, protectedPaths)) { lines.push(`=== ${f}`, '(protected path: content not included)'); continue; }
+      const room = 2 * 1024 * 1024 - total;
+      if (room <= 0) { lines.push(`=== ${f}`, '(not included: the evidence file reached 2 MB; read the file at the candidate commit)'); continue; }
+      const d = gitops.git(['diff', '--no-color', '--no-ext-diff', '--no-textconv', '--no-renames', v.diff.base, c.commit, '--', `:(literal)${f}`], { cwd: ctx.paths.projectDir });
+      const text = d.code === 0 ? d.stdout : `(the diff of ${f} could not be produced: ${d.stderr.trim()})`;
+      lines.push(text.length > room ? `${text.slice(0, room)}\n(truncated at 2 MB)` : text);
+      total += Math.min(text.length, room);
+    }
+  } else if (c.kind === 'shared') {
+    let total = 0;
+    for (const f of Object.keys(c.files || {}).sort()) {
+      lines.push(`=== ${f} (${c.files[f] === null ? 'deleted' : c.files[f]})`);
+      if (c.files[f] === null) continue;
+      if (security.isProtectedPath(f, protectedPaths)) { lines.push('(protected path: content not included)'); continue; }
+      if (!String(c.files[f]).startsWith('sha256:')) { lines.push('(not a regular file)'); continue; }
+      const buf = fs.readFileSync(path.join(ctx.paths.projectDir, ...f.split('/')));
+      if (buf.includes(0)) { lines.push(`(binary, ${buf.length} bytes)`); continue; }
+      const room = 2 * 1024 * 1024 - total;
+      if (room <= 0) { lines.push('(not included: the evidence file reached 2 MB; read the file itself)'); continue; }
+      const text = buf.toString('utf8');
+      lines.push(text.length > room ? `${text.slice(0, room)}\n(truncated at 2 MB)` : text);
+      total += Math.min(text.length, room);
+    }
+  } else {
+    lines.push(c.kind === 'readonly' ? 'Read-only task: no file was changed; review its report and the verification evidence.' : 'No change: the candidate is the integration head the task was dispatched with.');
+  }
+  return writeRunFile(ctx.env, ctx.run.run_id, `packages/${t.task_id}-review-${n}.evidence.txt`, lines.join('\n') + '\n');
+}
+
 function cmdReviewPackage(env, a) {
   cliargs.checkAllowed(a.opts, ['inline'], 'review-package');
   const id = a.pos[0];
   if (!id) usage('review-package needs a task id');
   return locked(env, () => {
     const ctx = openRun(env);
-    const t = getTask(ctx, id);
+    let t = getTask(ctx, id);
     if (t.status !== 'REVIEWING') {
       refuse(`no review package for ${id}`, `${id} is ${t.status}; an independent review starts after verification passed (REVIEWING)`, firstNext(ctx, 'oo status'));
     }
@@ -1309,36 +1795,52 @@ function cmdReviewPackage(env, a) {
     if (chk.state === 'exceeded' || remaining < 1) {
       refuse(`no review package for ${id}: the budget is exceeded`, chk.messages.length ? chk.messages : ['no agent calls remain'], 'ask the user; a higher limit is recorded only with oo authorize --limit agent_call_limit --value <n> --by user --reason <text>');
     }
+    const v = t.evidence.verification || {};
+    if (!v.candidate) {
+      refuse(`no review package for ${id}`, 'the passed verification recorded no candidate (it predates candidate binding)', `run the verification again: oo block ${id} --reason <text>, oo unblock ${id} --reason <text>, and repeat the attempt`);
+    }
+    if (v.candidate.kind === 'shared') {
+      const intact = sharedCandidateIntact(ctx, v.candidate);
+      if (!intact.ok) {
+        t = move(ctx, t, 'CORRECTION_REQUIRED', { kind: 'candidate_changed', reason: `the verified files changed after verification: ${intact.problem || intact.changed.join(', ')}` });
+        persist(ctx, { command: 'review-package', task_id: id, outcome: 'candidate_changed' });
+        say(env, `CANDIDATE CHANGED: ${id} -> CORRECTION_REQUIRED`, `  the verified content of ${intact.changed.join(', ') || intact.problem} is no longer in the workspace; a review of different content would not bind to the verified candidate`,
+          `NEXT: oo correct ${id} --stdin (the next attempt is verified again)`);
+        return 1;
+      }
+    }
     const role = t.security_sensitive ? 'security-worker' : 'review-worker';
     const floor = t.routing && MODEL_ORDER.includes(t.routing.model) ? t.routing.model : 'auto';
     const rspec = Object.assign({}, t, { kind: 'review', assigned_role: role, assigned_model: floor });
     const rr = routing.route(rspec, ctx.cfg, readStats(ctx), ctx.run.options.mode);
     const agent = rr.agent || 'opus-reviewer';
-    const v = t.evidence.verification || {};
-    const changes = v.diff && v.diff.base
-      ? { kind: 'diff', cwd: absProject(env, v.diff.cwd || '.'), command: `git diff ${v.diff.base} ${v.diff.commit}`, files: v.changed_files || [] }
-      : { kind: 'files', files: v.changed_files || [] };
-    changes.reported = (t.result && t.result.files_changed) || [];
-    const evidenceFiles = [v.evidence_file, t.result && t.result.report_file].filter(Boolean).map((f) => absProject(env, f));
     const n = (t.review_packages || 0) + 1;
+    const reviewId = `${id}-r${n}-${require('node:crypto').randomBytes(3).toString('hex')}`;
+    const pinned = pinnedReviewEvidence(ctx, t, n);
+    const changes = { kind: 'pinned', file: pinned, files: v.changed_files || [], reported: (t.result && t.result.files_changed) || [] };
+    const evidenceFiles = [v.evidence_file, t.result && t.result.report_file].filter(Boolean).map((f) => absProject(env, f));
     const text = packages.reviewPackage(t, {
-      reviewer: agent, changes, evidenceFiles,
+      reviewer: agent, reviewId, changes, evidenceFiles, candidate: candidateId(v.candidate),
       verificationSummary: v.passed ? `passed at ${v.run_at}: ${(v.reasons || []).join('; ')}` : 'not passed',
     });
     const file = writeRunFile(env, ctx.run.run_id, `packages/${id}-review-${n}.md`, text);
     t.review_packages = n;
+    t.review_dispatches = (t.review_dispatches || []).concat([{
+      review_id: reviewId, n, round: t.review_round || 0, attempt_id: t.dispatch && t.dispatch.attempt_id, perspective: role, agent, model: rr.model,
+      candidate_id: candidateId(v.candidate), issued_at: ctx.now, status: 'issued', package: relProject(env, file), evidence: relProject(env, pinned),
+    }]);
     // The current round's evidence records the package; a correction archives it, so each round needs its own.
-    t.evidence.review_packages = (t.evidence.review_packages || []).concat([{ n, at: ctx.now, round: t.review_round || 0, file: relProject(env, file) }]);
+    t.evidence.review_packages = (t.evidence.review_packages || []).concat([{ n, at: ctx.now, round: t.review_round || 0, file: relProject(env, file), review_id: reviewId }]);
     touch(ctx, t);
     ctx.run.usage = budget.recordCall(ctx.run.usage, { task_id: id, kind: 'review' });
-    persist(ctx, { command: 'review-package', task_id: id, n });
+    persist(ctx, { command: 'review-package', task_id: id, n, review_id: reviewId });
     const target = agentTarget(env, agent);
-    say(env, `REVIEW PACKAGE ${id} #${n} (independent review; model routed for a review of complexity ${t.complexity}, at least the worker's model)`);
+    say(env, `REVIEW PACKAGE ${id} #${n} (review ${reviewId}; independent review of candidate ${candidateId(v.candidate)}; model routed for a review of complexity ${t.complexity}, at least the worker's model)`);
     say(env, packages.agentCallLine({ subagentType: target.subagentType, model: rr.model, description: packages.describeTask({ task_id: `${id} review`, title: t.title }) }));
-    if (target.agentFile) say(env, `(agent ${agent} is not installed in .claude/agents; the prompt tells general-purpose to read its definition first)`);
+    if (target.agentFile) say(env, `(agent ${agent} is not installed in .claude/agents; the prompt tells general-purpose to read its definition first, and general-purpose has a shell: install the agents for a read-only reviewer)`);
     if (a.opts.inline) printPrompt(env, (target.agentFile ? `First read ${target.agentFile} and follow it as your role definition.\n\n` : '') + text);
     else printPrompt(env, packages.shortPrompt(file, target.agentFile));
-    say(env, `NEXT: launch the reviewer, then oo review ${id} --stdin with its report`);
+    say(env, `NEXT: launch the reviewer, then oo review ${id} --stdin --agent-id <the agent id the Agent tool returned> with its report (if the reviewer is lost: oo review-abandon ${id} --review ${reviewId} --reason <text>)`);
     return 0;
   });
 }
@@ -1350,10 +1852,19 @@ function highRiskReviewers(ctx, t) {
   return Number.isInteger(mode.reviewers_high_risk) && mode.reviewers_high_risk > 1 ? mode.reviewers_high_risk : 1;
 }
 
+/** Approving independent reviews of the current round from distinct reviewer agents. */
+function distinctApprovals(t) {
+  const ids = new Set();
+  for (const r of (t.evidence.reviews || [])) if (r.independent && r.verdict === 'approve') ids.add(r.agent_id || r.review_id || r.reviewer);
+  return ids.size;
+}
+
 function cmdReview(env, a) {
-  cliargs.checkAllowed(a.opts, ['stdin', 'file', 'integrate'], 'review');
+  cliargs.checkAllowed(a.opts, ['stdin', 'file', 'integrate', 'agent-id'], 'review');
   const id = a.pos[0];
   if (!id) usage('review needs a task id: oo review <ID> --stdin');
+  const agentId = a.opts['agent-id'] !== undefined ? String(a.opts['agent-id']).trim() : null;
+  if (agentId !== null && !/^[A-Za-z0-9._:-]{1,128}$/.test(agentId)) usage('--agent-id must be the agent id the host printed (letters, digits, . _ : -)');
   const text = readInput(a);
   let approved = false;
   const code = locked(env, () => {
@@ -1375,17 +1886,55 @@ function cmdReview(env, a) {
     const rv = v.review;
     const independent = rv.reviewer !== 'orchestrator';
     const round = t.review_round || 0;
-    if (independent && !(t.evidence.review_packages || []).length) {
-      refuse(`review of ${id} refused; task state unchanged`,
-        `the reviewer is ${JSON.stringify(rv.reviewer)}, not orchestrator, and no review package was issued for ${id} in the current round (round ${round}); an independent review is accepted only from a reviewer launched with oo review-package in this round`,
-        `oo review-package ${id}, launch the reviewer it prints, then oo review ${id} --stdin with that reviewer's report (for your own quality gate use reviewer: orchestrator)`);
+    const unchanged = `review of ${id} refused; task state unchanged`;
+    const ver = t.evidence.verification || {};
+    let dispatch = null;
+    if (independent) {
+      if (!(t.evidence.review_packages || []).length) {
+        refuse(unchanged,
+          `the reviewer is ${JSON.stringify(rv.reviewer)}, not orchestrator, and no review package was issued for ${id} in the current round (round ${round}); an independent review is accepted only from a reviewer launched with oo review-package in this round`,
+          `oo review-package ${id}, launch the reviewer it prints, then oo review ${id} --stdin --agent-id <id> with that reviewer's report (for your own quality gate use reviewer: orchestrator)`);
+      }
+      const rid = typeof rv.review_id === 'string' ? rv.review_id.trim() : '';
+      dispatch = (t.review_dispatches || []).find((x) => x.review_id === rid) || null;
+      const why = [];
+      if (!rid) why.push('the review report has no review_id (copy it from the report block of the review package)');
+      else if (!dispatch) why.push(`review ${rid} was never issued for ${id}`);
+      else {
+        if (dispatch.status === 'abandoned') why.push(`review ${rid} was abandoned at ${dispatch.abandoned_at} (${dispatch.abandon_reason}); a late report of an abandoned review is never applied`);
+        if (dispatch.status === 'recorded') why.push(`review ${rid} was already recorded at ${dispatch.recorded_at}; a duplicate report is not applied`);
+        if (dispatch.round !== round) why.push(`review ${rid} was issued for round ${dispatch.round}, and the task is in round ${round}`);
+        if (dispatch.attempt_id !== (t.dispatch && t.dispatch.attempt_id)) why.push(`review ${rid} was issued for attempt ${dispatch.attempt_id}, and the current attempt is ${t.dispatch && t.dispatch.attempt_id}`);
+        if (dispatch.candidate_id !== ver.candidate_id) why.push(`review ${rid} reviewed candidate ${dispatch.candidate_id}, and the verified candidate is ${ver.candidate_id}`);
+      }
+      if (!agentId) why.push('an independent review needs --agent-id <the agent id the Agent tool returned for this reviewer>, so that distinct reviewers can be told apart');
+      else {
+        if (t.result && t.result.agent_id && t.result.agent_id === agentId) why.push(`agent ${agentId} is the worker that produced this result; it cannot review its own work`);
+        const same = (t.review_dispatches || []).find((x) => x.status === 'recorded' && x.round === round && x.agent_id === agentId);
+        if (same) why.push(`agent ${agentId} already recorded review ${same.review_id} in this round; a second report from the same agent is not a second independent review`);
+      }
+      if (why.length) refuse(unchanged, why, `only the report of an issued, still open review of the verified candidate is accepted; a lost reviewer is replaced with oo review-abandon ${id} --review <id> --reason <text> and a new oo review-package ${id}`);
+    }
+    // Integrity: the reviewed candidate must still be what verification saw.
+    if (ver.candidate && ver.candidate.kind === 'shared') {
+      const intact = sharedCandidateIntact(ctx, ver.candidate);
+      if (!intact.ok) {
+        t = move(ctx, t, 'CORRECTION_REQUIRED', { kind: 'candidate_changed', reason: `the verified files changed after verification: ${intact.problem || intact.changed.join(', ')}` });
+        persist(ctx, { command: 'review', task_id: id, outcome: 'candidate_changed' });
+        say(env, `CANDIDATE CHANGED: ${id} -> CORRECTION_REQUIRED; the review was not recorded`, `  changed since verification: ${intact.changed.join(', ') || intact.problem}`, `NEXT: oo correct ${id} --stdin`);
+        return 1;
+      }
     }
     const n = ((t.evidence.reviews || []).length) + 1;
     const entry = {
       reviewer: rv.reviewer, independent, verdict: rv.verdict, criteria: rv.criteria, findings: rv.findings || [],
       checks: rv.checks || {}, recorded_at: ctx.now, round, report_file: null,
+      review_id: dispatch ? dispatch.review_id : null, agent_id: independent ? agentId : null, candidate_id: ver.candidate_id || null,
     };
     t.evidence.reviews = (t.evidence.reviews || []).concat([entry]);
+    if (dispatch) {
+      t.review_dispatches = t.review_dispatches.map((x) => (x.review_id === dispatch.review_id ? Object.assign({}, x, { status: 'recorded', recorded_at: ctx.now, agent_id: agentId, verdict: rv.verdict }) : x));
+    }
     touch(ctx, t);
     let outcome;
     if (rv.verdict === 'approve') {
@@ -1394,13 +1943,13 @@ function cmdReview(env, a) {
       } else {
         const requires = !!(t.routing && (t.routing.independent_review || t.routing.role === 'orchestrator'));
         const needed = highRiskReviewers(ctx, t);
-        const have = (t.evidence.reviews || []).filter((x) => x.independent && x.verdict === 'approve').length;
+        const have = distinctApprovals(t);
         if (needed > 1 && have < needed) {
           refuse(`approval of ${id} refused; task state unchanged`,
-            `${id} is high risk and mode ${ctx.run.options.mode} requires ${needed} approving independent reviews in the current round (round ${round}); ${have} recorded`,
-            `oo review-package ${id}, launch the next reviewer, record its report with oo review ${id} --stdin until ${needed} approve, then approve again`);
+            `${id} is high risk and mode ${ctx.run.options.mode} requires ${needed} approving independent reviews from distinct reviewer agents in the current round (round ${round}); ${have} recorded`,
+            `oo review-package ${id}, launch the next reviewer, record its report with oo review ${id} --stdin --agent-id <id> until ${needed} approve, then approve again`);
         }
-        t = move(ctx, t, 'APPROVED', { reason: 'approved by the orchestrator', requiresIndependentReview: requires });
+        t = move(ctx, t, 'APPROVED', { reason: `approved by the orchestrator (candidate ${ver.candidate_id || '?'})`, requiresIndependentReview: requires });
         outcome = 'approved';
       }
     } else {
@@ -1412,15 +1961,15 @@ function cmdReview(env, a) {
     const cur = ctx.byId.get(id);
     cur.evidence.reviews[cur.evidence.reviews.length - 1].report_file = relProject(env, file);
     touch(ctx, cur);
-    ctx.events.push({ type: 'review', task_id: id, reviewer: rv.reviewer, verdict: rv.verdict, independent });
+    ctx.events.push({ type: 'review', task_id: id, reviewer: rv.reviewer, verdict: rv.verdict, independent, review_id: entry.review_id, agent_id: entry.agent_id });
     persist(ctx, { command: 'review', task_id: id, outcome });
 
     if (outcome === 'independent_approve') {
       const needed = highRiskReviewers(ctx, ctx.byId.get(id));
-      const have = (ctx.byId.get(id).evidence.reviews || []).filter((x) => x.independent && x.verdict === 'approve').length;
-      say(env, `INDEPENDENT REVIEW RECORDED: ${id} approved by ${rv.reviewer}; ${id} stays REVIEWING until your own gate`,
+      const have = distinctApprovals(ctx.byId.get(id));
+      say(env, `INDEPENDENT REVIEW RECORDED: ${id} approved by ${rv.reviewer} (review ${entry.review_id}, agent ${agentId}); ${id} stays REVIEWING until your own gate`,
         have < needed
-          ? `NEXT: ${id} is high risk and needs ${needed} approving independent reviews in this round (${have} so far): oo review-package ${id}, launch the next reviewer, then oo review ${id} --stdin`
+          ? `NEXT: ${id} is high risk and needs ${needed} approving independent reviews from distinct reviewer agents in this round (${have} so far): oo review-package ${id}, launch the next reviewer, then oo review ${id} --stdin --agent-id <id>`
           : `NEXT: oo review ${id} --stdin with your own review (reviewer: orchestrator)`);
     } else if (outcome === 'approved') {
       approved = true;
@@ -1433,8 +1982,28 @@ function cmdReview(env, a) {
     }
     return 0;
   });
-  if (code === 0 && approved && a.opts.integrate) return runIntegrate(env, id);
+  if (code === 0 && approved && a.opts.integrate) return runIntegrate(env, id, {});
   return code;
+}
+
+function cmdReviewAbandon(env, a) {
+  cliargs.checkAllowed(a.opts, ['review', 'reason'], 'review-abandon');
+  const id = a.pos[0];
+  if (!id || typeof a.opts.review !== 'string') usage('review-abandon needs a task id and --review <review id>: oo review-abandon <ID> --review <RID> --reason <text>');
+  const reason = needReason(a);
+  return locked(env, () => {
+    const ctx = openRun(env);
+    const t = getTask(ctx, id);
+    const d = (t.review_dispatches || []).find((x) => x.review_id === a.opts.review);
+    if (!d) refuse(`review ${a.opts.review} not abandoned`, `no review ${a.opts.review} was issued for ${id}`, 'oo status');
+    if (d.status !== 'issued') refuse(`review ${a.opts.review} not abandoned`, `review ${a.opts.review} is ${d.status}`, 'only an issued review whose report has not been recorded can be abandoned');
+    t.review_dispatches = t.review_dispatches.map((x) => (x.review_id === d.review_id ? Object.assign({}, x, { status: 'abandoned', abandoned_at: ctx.now, abandon_reason: reason }) : x));
+    touch(ctx, t);
+    ctx.events.push({ type: 'review_abandoned', task_id: id, review_id: d.review_id, reason });
+    persist(ctx, { command: 'review-abandon', task_id: id, review_id: d.review_id });
+    say(env, `REVIEW ABANDONED: ${d.review_id} of ${id} (${reason}); a late report from it is refused`, `NEXT: ${t.status === 'REVIEWING' ? `oo review-package ${id} to issue a replacement review` : firstNext(ctx, 'oo status')}`);
+    return 0;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1499,96 +2068,216 @@ function integrationCommands(ctx, t) {
   return { cmds, regression };
 }
 
-function runIntegrate(env, id) {
+function runIntegrate(env, id, o) {
+  const opts = o || {};
   const prep = locked(env, () => {
     const ctx = openRun(env);
     let t = getTask(ctx, id);
     if (!['APPROVED', 'INTEGRATING'].includes(t.status)) {
       refuse(`integration of ${id} not started`, `${id} is ${t.status}; integration needs an APPROVED task`, firstNext(ctx, 'oo status'));
     }
+    const prevOp = t.pending_op && t.pending_op.kind === 'integrate' ? t.pending_op : null;
+    const takeoverNote = opGate(t.pending_op, `integration of ${id}`, opts.takeover);
     const ws = ctx.run.workspace || {};
+    const ver = t.evidence.verification || {};
+    const cand = ver.candidate || null;
+    if (!cand) refuse(`integration of ${id} not started`, 'the passed verification recorded no candidate (it predates candidate binding)', `oo block ${id} --reason <text>, then oo unblock to repeat the attempt`);
+    const gate = (t.evidence.reviews || []).filter((r) => r.reviewer === 'orchestrator').pop();
+    if (!gate || gate.candidate_id !== ver.candidate_id) {
+      refuse(`integration of ${id} not started`, `the approval does not name the verified candidate ${ver.candidate_id}`, `review the verified candidate again: oo review ${id} --stdin`);
+    }
+    const blockWith = (kind, reason) => {
+      t.pending_op = null;
+      move(ctx, t, 'BLOCKED', { kind, reason });
+      persist(ctx, { command: 'integrate', task_id: id, outcome: kind });
+      return { blocked: true, kind, reason };
+    };
+    let plan;
     if (ws.strategy === 'worktree') {
       const other = ctx.tasks.find((x) => x.status === 'INTEGRATING' && x.task_id !== id);
       if (other) refuse(`integration of ${id} not started`, `${other.task_id} is being integrated into the same branch`, `finish it first: oo integrate ${other.task_id}`);
+      checkRepoGuard(ctx, `integration of ${id}`);
+      const intDir = integrationDir(ctx);
+      if (!ws.integration_head) refuse(`integration of ${id} not started`, 'this run predates integration-head tracking', 'finish it by hand or start a new run');
+      let dirty;
+      let ops;
+      try {
+        dirty = workspace.uncommittedFiles(intDir);
+        ops = gitops.operationsInProgress(intDir);
+      } catch (e) {
+        return blockWith('integration_unreadable', `the integration worktree's status cannot be read: ${e.message}`);
+      }
+      if (dirty.length || ops.length) return blockWith('integration_dirty', `the integration worktree is not clean (${dirty.concat(ops).join(', ')}); oo does not merge over changes it did not make`);
+      const head = gitops.revParse(intDir, 'HEAD');
+      let recover = false;
+      if (head !== ws.integration_head) {
+        if (prevOp && prevOp.merge_sha && prevOp.merge_sha === head && prevOp.checks_passed === true) recover = true;
+        else return blockWith('integration_moved', `the integration branch is at ${head}, but oo last left it at ${ws.integration_head}; something other than oo moved it`);
+      }
+      plan = {
+        mode: cand.kind === 'commit' ? 'merge' : 'check', strategy: 'worktree', expected: ws.integration_head, candidate: cand, recover,
+        prev: prevOp, intDir,
+      };
+    } else {
+      const busy = sharedWindowConflict(ctx, t);
+      if (busy) refuse(`integration of ${id} not started`, `shared workspace: ${busy.task_id} is ${busy.status} in the same directory, and its changes would mix with this integration`, `finish or verify ${busy.task_id} first, then oo integrate ${id}`);
+      const intact = sharedCandidateIntact(ctx, cand);
+      if (!intact.ok) {
+        t.pending_op = null;
+        // APPROVED has no direct way back to a correction; the integration that found the change
+        // is what fails, so the task passes through INTEGRATING.
+        if (t.status === 'APPROVED') t = move(ctx, t, 'INTEGRATING', { reason: 'integration started' });
+        t = move(ctx, t, 'CORRECTION_REQUIRED', { kind: 'candidate_changed', reason: `the verified files changed after verification: ${intact.problem || intact.changed.join(', ')}` });
+        persist(ctx, { command: 'integrate', task_id: id, outcome: 'candidate_changed' });
+        return { changed: intact.changed.length ? intact.changed : [intact.problem] };
+      }
+      plan = { mode: 'shared', strategy: 'shared', candidate: cand };
     }
-    if (t.status === 'APPROVED') {
-      t = move(ctx, t, 'INTEGRATING', { reason: 'integration started' });
-      persist(ctx, { command: 'integrate', task_id: id, phase: 'start' });
-    }
+    if (t.status === 'APPROVED') t = move(ctx, t, 'INTEGRATING', { reason: `integration started (candidate ${ver.candidate_id})` });
+    t.pending_op = newOp('integrate', { candidate_id: ver.candidate_id, expected_head: plan.expected || null });
+    if (plan.recover) Object.assign(t.pending_op, { merge_sha: plan.prev.merge_sha, checks_passed: true, evidence_file: plan.prev.evidence_file || null, recovered_from: plan.prev.id });
+    if (takeoverNote) t.history.push({ ts: ctx.now, from: t.status, to: t.status, reason: takeoverNote, actor: 'oo' });
+    touch(ctx, t);
+    persist(ctx, { command: 'integrate', task_id: id, phase: 'start', op: t.pending_op.id });
     const { cmds, regression } = integrationCommands(ctx, t);
-    return {
-      strategy: ws.strategy, intDir: integrationDir(ctx), commit: t.result && t.result.worktree ? t.result.commit : null,
-      title: t.title, cmds, regression,
-      timeout: (Number(ctx.cfg.execution.command_timeout_seconds) || 600) * 1000,
-      extraUnsafe: (ctx.cfg.security && ctx.cfg.security.extra_unsafe_patterns) || [],
-    };
+    return Object.assign(plan, {
+      opId: t.pending_op.id, title: t.title, cmds, regression, setup: setupCommands(ctx), copts: commandOpts(ctx), policy: generated(ctx),
+      runId: ctx.run.run_id, takeoverNote,
+    });
   });
+  if (prep.blocked) {
+    say(env, `INTEGRATION NOT STARTED: ${id} -> BLOCKED (kind ${prep.kind})`, `  ${prep.reason}`, `NEXT: inspect the integration worktree; nothing was merged or forced. Then oo unblock ${id} --reason <text> or ask the user`);
+    return 1;
+  }
+  if (prep.changed) {
+    say(env, `CANDIDATE CHANGED: ${id} -> CORRECTION_REQUIRED; nothing was integrated`, `  changed since verification: ${prep.changed.join(', ')}`, `NEXT: oo correct ${id} --stdin`);
+    return 1;
+  }
 
+  // Outside the lock: merge in a clean checkout, the checks on that exact commit, then the fast-forward.
+  const ctxView = openRun(env);
   let outcome;
-  const run = (cwd) => (prep.cmds.length
-    ? verify.runCommands(prep.cmds, { cwd, timeout_ms: prep.timeout, extraUnsafe: prep.extraUnsafe })
-    : { passed: null, shell: null, commands: [] });
-  if (prep.strategy === 'worktree' && prep.commit) {
-    const cwd = prep.intDir;
+  const empty = { passed: null, shell: null, commands: [], env_removed: [] };
+  const notes = [];
+  if (prep.recover) {
+    outcome = { kind: 'ok', cwd: prep.intDir, sha: prep.prev.merge_sha, before: prep.expected, cr: empty, mutations: [], merged: true };
+    notes.push(`finalized the interrupted integration ${prep.prev.id}: its merge commit ${prep.prev.merge_sha} had passed the checks and was already on the integration branch`);
+  } else if (prep.strategy === 'worktree') {
+    let dir = null;
     try {
-      gitops.abortMerge(cwd);
-      const before = gitops.git(['rev-parse', 'HEAD'], { cwd }).stdout.trim();
-      const m = gitops.mergeNoCommit(cwd, prep.commit);
-      if (m.conflict) {
-        gitops.abortMerge(cwd);
-        outcome = { kind: 'conflict', cwd, files: m.files, before, cr: { passed: null, shell: null, commands: [] } };
-      } else {
-        const cr = run(cwd);
-        if (cr.passed !== false) {
-          const sha = gitops.commitMerge(cwd, `opus-orch: integrate ${id}: ${prep.title}`);
-          outcome = { kind: 'ok', cwd, sha, before, cr };
+      dir = cleanCheckout(ctxView, `integrate-${id}`, prep.expected);
+      let sha = prep.expected;
+      let merged = false;
+      if (prep.mode === 'merge') {
+        const m = gitops.mergeNoCommit(dir, prep.candidate.commit);
+        if (m.conflict) {
+          gitops.abortMerge(dir);
+          outcome = { kind: 'conflict', cwd: dir, files: m.files, before: prep.expected, cr: empty };
         } else {
-          gitops.abortMerge(cwd);
-          outcome = { kind: 'failed', cwd, before, cr };
+          sha = gitops.commitMerge(dir, `opus-orch: integrate ${id}: ${prep.title}`);
+          merged = sha !== prep.expected;
+        }
+      }
+      if (!outcome) {
+        const cr = runChecked(dir, prep.setup, prep.cmds, prep.copts);
+        let mutations = [];
+        let unreadable = null;
+        try {
+          mutations = checkoutMutations(dir, prep.policy);
+        } catch (e) {
+          unreadable = e.message;
+        }
+        const bad = mutations.filter((x) => !x.generated).map((x) => x.path);
+        if (cr.passed === false || bad.length || unreadable) {
+          outcome = { kind: 'failed', cwd: dir, before: prep.expected, cr, mutations, reasons: bad.length ? [`the integration commands changed ${bad.join(', ')}`] : unreadable ? [unreadable] : null };
+        } else {
+          outcome = { kind: 'ok', cwd: dir, sha, before: prep.expected, cr, mutations, merged };
         }
       }
     } catch (e) {
-      try { gitops.abortMerge(cwd); } catch (_) { /* nothing to abort */ }
-      outcome = { kind: 'merge_failed', cwd, message: e.message, cr: { passed: null, shell: null, commands: [] } };
+      outcome = { kind: 'merge_failed', cwd: dir || prep.intDir, message: e.message, cr: empty };
+    }
+    notes.push(`clean integration checkout ${dir ? relProject(env, dir) : '(not created)'}: ${dir && outcome.kind !== 'failed' ? dropCheckout(ctxView, dir) : (dir ? 'kept as evidence' : 'none')}`);
+    if (outcome.kind === 'ok' && outcome.merged) {
+      // The integration commands ran candidate code; a hook or filter it planted in the shared git
+      // directory would run inside the fast-forward below, so the guard is checked again first.
+      const guardNow = (() => { try { return gitops.repoGuard(env.paths.projectDir); } catch (e) { return `unreadable: ${e.message}`; } })();
+      if (ctxView.run.workspace.repo_guard && guardNow !== ctxView.run.workspace.repo_guard) {
+        outcome = { kind: 'merge_failed', cwd: prep.intDir, message: 'the repository configuration, hooks or info files changed while the integration commands ran; the integration branch was not moved (inspect .git/hooks, .git/config and .git/info, then oo repo-guard)', cr: outcome.cr };
+      }
+    }
+    if (outcome.kind === 'ok' && outcome.merged) {
+      // Record the verified merge commit before the branch moves, so an interruption can be finalized.
+      const recorded = locked(env, () => {
+        const ctx = openRun(env);
+        const t = getTask(ctx, id);
+        if (!t.pending_op || t.pending_op.id !== prep.opId) return false;
+        Object.assign(t.pending_op, { merge_sha: outcome.sha, checks_passed: true });
+        touch(ctx, t);
+        persist(ctx, { command: 'integrate', task_id: id, phase: 'checked', merge_sha: outcome.sha });
+        return true;
+      });
+      if (!recorded) outcome = { kind: 'superseded', cwd: prep.intDir, cr: outcome.cr };
+      else {
+        const ff = gitops.git(['merge', '--ff-only', outcome.sha], { cwd: prep.intDir });
+        if (ff.code !== 0 || gitops.revParse(prep.intDir, 'HEAD') !== outcome.sha) {
+          outcome = { kind: 'merge_failed', cwd: prep.intDir, message: `the integration branch could not be fast-forwarded to the checked merge commit ${outcome.sha}: ${(ff.stderr || ff.stdout).trim()}`, cr: outcome.cr };
+        }
+      }
     }
   } else {
-    const cwd = prep.strategy === 'worktree' ? prep.intDir : env.paths.projectDir;
-    const cr = run(cwd);
-    outcome = { kind: cr.passed !== false ? 'ok' : 'failed', cwd, sha: null, cr };
+    const root = env.paths.projectDir;
+    const pre = gitops.snapshot(root, { ignore: workspace.snapshotIgnore(env.paths) });
+    const cr = runChecked(root, prep.setup, prep.cmds, prep.copts);
+    const post = gitops.snapshot(root, { ignore: workspace.snapshotIgnore(env.paths) });
+    const cmp = gitops.compareSnapshots(pre, post);
+    const mutations = cmp.ok ? cmp.changed.map((p) => ({ path: p, generated: workspace.isGenerated(p, prep.policy) })) : [];
+    const bad = mutations.filter((x) => !x.generated).map((x) => x.path);
+    if (!cmp.ok || cr.passed === false || bad.length) {
+      outcome = { kind: 'failed', cwd: root, cr, mutations, reasons: !cmp.ok ? cmp.problems : bad.length ? [`the integration commands changed ${bad.join(', ')}`] : null };
+    } else {
+      outcome = { kind: 'ok', cwd: root, sha: null, cr, mutations };
+    }
   }
 
   return locked(env, () => {
     const ctx = openRun(env);
     let t = getTask(ctx, id);
-    if (t.status !== 'INTEGRATING') {
-      refuse(`integration result for ${id} discarded`, `${id} moved to ${t.status} while integration ran`, firstNext(ctx, 'oo status'));
+    if (t.status !== 'INTEGRATING' || !t.pending_op || t.pending_op.id !== prep.opId || outcome.kind === 'superseded') {
+      refuse(`integration result for ${id} discarded`, `the integration ${prep.opId} is no longer current (${id} is ${t.status})`, firstNext(ctx, 'oo status'));
     }
+    t.pending_op = null;
     const cr = outcome.cr;
     const passed = outcome.kind === 'ok';
     const n = (t.integration_runs || 0) + 1;
+    const reasons = outcome.kind === 'conflict' ? [`merge conflict in ${outcome.files.join(', ')}`] : outcome.kind === 'merge_failed' ? [outcome.message] : outcome.reasons || null;
     const evRel = store.writeEvidence(ctx.paths, ctx.run.run_id, `${id}-integrate-${n}.txt`, evidenceText(
-      `Integration ${n} of ${id} (${prep.strategy} workspace${prep.commit ? `, merge of ${prep.commit}` : ''})`,
-      { at: ctx.now, cwd: outcome.cwd, shell: cr.shell, commands: cr.commands, passed, reasons: outcome.kind === 'conflict' ? [`merge conflict in ${outcome.files.join(', ')}`] : outcome.kind === 'merge_failed' ? [outcome.message] : null }));
+      `Integration ${n} of ${id} (${prep.strategy} workspace${prep.mode === 'merge' ? `, merge of the verified candidate ${prep.candidate.commit}` : ''})`,
+      { at: ctx.now, cwd: outcome.cwd, shell: cr.shell, commands: cr.commands, passed, reasons, candidate: prep.candidate, envRemoved: cr.env_removed, mutations: outcome.mutations, notes: notes.concat(prep.takeoverNote ? [prep.takeoverNote] : []) }));
     t.integration_runs = n;
     t.evidence.integration = {
-      passed, run_at: ctx.now, commands: cr.commands, merged_commit: outcome.sha || null, regression: prep.regression,
-      conflict_files: outcome.files || [], evidence_file: evRel,
+      passed, run_at: ctx.now, commands: cr.commands, merged_commit: passed && outcome.merged ? outcome.sha : null,
+      integrated_head: passed ? (outcome.sha || null) : null, candidate_id: candidateId(prep.candidate), regression: prep.regression,
+      conflict_files: outcome.files || [], evidence_file: evRel, mutations: outcome.mutations || [],
+      files: prep.candidate.kind === 'shared' ? prep.candidate.files : null, notes,
     };
     touch(ctx, t);
+    if (passed && prep.strategy === 'worktree') ctx.run.workspace.integration_head = outcome.sha;
     if (passed) {
-      move(ctx, t, 'COMPLETED', { reason: outcome.sha ? `merged as ${outcome.sha}` : 'integration checks passed' });
+      move(ctx, t, 'COMPLETED', { reason: outcome.merged ? `merged as ${outcome.sha}` : 'integration checks passed' });
     } else if (outcome.kind === 'conflict') {
       move(ctx, t, 'BLOCKED', { kind: 'merge_conflict', reason: `merge conflict in ${outcome.files.join(', ') || 'unknown files'}; integration branch unchanged at ${outcome.before}` });
     } else if (outcome.kind === 'merge_failed') {
       move(ctx, t, 'BLOCKED', { kind: 'merge_failed', reason: oneLine(outcome.message, 300) });
     } else {
-      move(ctx, t, 'CORRECTION_REQUIRED', { reason: `integration checks failed: ${cr.commands.filter((c) => c.exit_code !== 0).map((c) => c.command).join(', ')}` });
+      move(ctx, t, 'CORRECTION_REQUIRED', { reason: `integration checks failed: ${(reasons || cr.commands.filter((c) => c.exit_code !== 0).map((c) => c.command)).join(', ')}` });
     }
     persist(ctx, { command: 'integrate', task_id: id, outcome: outcome.kind });
     const evAbs = absProject(env, evRel);
     if (passed) {
-      say(env, `INTEGRATED: ${id} -> COMPLETED${outcome.sha ? ` (merge commit ${outcome.sha} on ${ctx.run.workspace.integration_branch})` : ''}`);
+      say(env, `INTEGRATED: ${id} -> COMPLETED${outcome.merged ? ` (merge commit ${outcome.sha} on ${ctx.run.workspace.integration_branch})` : ''}`);
       if (cr.commands.length) say(env, 'Commands:', ...commandLines(cr.commands));
+      for (const nn of notes) say(env, `Note: ${nn}`);
       say(env, `Evidence: ${evAbs}`);
       const done = ctx.tasks.every((x) => x.status === 'COMPLETED' || x.status === 'CANCELLED');
       say(env, `NEXT: ${done ? 'oo final-report, then oo deliver' : firstNext(ctx, 'oo next')}`);
@@ -1597,7 +2286,7 @@ function runIntegrate(env, id) {
     if (outcome.kind === 'conflict') {
       say(env, `MERGE CONFLICT: ${id} -> BLOCKED (kind merge_conflict)`,
         `Conflicting files: ${outcome.files.join(', ') || '(not reported)'}`,
-        `The merge was aborted; the integration branch is unchanged at ${outcome.before}.`,
+        `The merge was made in a separate checkout and aborted; the integration branch is unchanged at ${outcome.before}.`,
         `Evidence: ${evAbs}`,
         `NEXT: oo unblock ${id} --reason <text> to send it back to a worker, whose package merges the current integration head first (or amend, or ask the user)`);
       return 1;
@@ -1606,8 +2295,9 @@ function runIntegrate(env, id) {
       say(env, `MERGE FAILED: ${id} -> BLOCKED (kind merge_failed): ${outcome.message}`, `Evidence: ${evAbs}`, `NEXT: inspect ${outcome.cwd}, then oo unblock ${id} --reason <text> or ask the user`);
       return 1;
     }
-    say(env, `INTEGRATION FAILED: ${id} -> CORRECTION_REQUIRED${prep.strategy === 'worktree' && prep.commit ? '; the merge was aborted and the integration branch is unchanged' : ''}`);
-    for (const c of cr.commands.filter((x) => x.refused || x.timed_out || x.exit_code !== 0)) {
+    say(env, `INTEGRATION FAILED: ${id} -> CORRECTION_REQUIRED${prep.strategy === 'worktree' ? '; the merge commit was never put on the integration branch, which is unchanged' : ''}`);
+    for (const r of reasons || []) say(env, `  - ${r}`);
+    for (const c of cr.commands.filter((x) => x.refused || x.timed_out || (!x.skipped && x.exit_code !== 0))) {
       say(env, `Failing command: ${c.command}`, `Exit code: ${c.refused ? 'refused' : c.timed_out ? 'timed out' : c.exit_code}`, 'Output tail:', ...indent(c.output_tail || '(no output)', '  | '));
     }
     say(env, `Evidence: ${evAbs}`, `NEXT: oo correct ${id} --stdin`);
@@ -1616,10 +2306,10 @@ function runIntegrate(env, id) {
 }
 
 function cmdIntegrate(env, a) {
-  cliargs.checkAllowed(a.opts, [], 'integrate');
+  cliargs.checkAllowed(a.opts, ['takeover'], 'integrate');
   const id = a.pos[0];
   if (!id) usage('integrate needs a task id: oo integrate <ID>');
-  return runIntegrate(env, id);
+  return runIntegrate(env, id, { takeover: a.opts.takeover });
 }
 
 // ---------------------------------------------------------------------------
@@ -1736,6 +2426,8 @@ function cmdBlock(env, a) {
     const ctx = openRun(env);
     const t = getTask(ctx, id);
     const wasInFlight = sm.IN_FLIGHT.includes(t.status);
+    if (wasInFlight) closeAttempt(t, 'blocked', ctx.now, `blocked: ${reason}`);
+    if (t.pending_op && store.ownerState(t.pending_op) !== 'alive') t.pending_op = null;
     move(ctx, t, 'BLOCKED', { reason, kind: a.opts.kind || 'manual' });
     persist(ctx, { command: 'block', task_id: id });
     say(env, `BLOCKED: ${id} (${reason})${wasInFlight ? '; its agent may still be running: ignore its output' : ''}`, `NEXT: resolve it, then oo unblock ${id} --reason <text>`);
@@ -1769,6 +2461,7 @@ function cmdFail(env, a) {
   return locked(env, () => {
     const ctx = openRun(env);
     const t = getTask(ctx, id);
+    if (sm.IN_FLIGHT.includes(t.status)) closeAttempt(t, 'failed', ctx.now, `failed: ${reason}`);
     move(ctx, t, 'FAILED', { reason, kind: a.opts.kind || 'manual' });
     persist(ctx, { command: 'fail', task_id: id });
     say(env, `FAILED: ${id} (${reason})`, `NEXT: oo escalate ${id} --model <stronger model> --reason <text>, oo amend, or ask the user`);
@@ -1787,7 +2480,10 @@ function cmdCancel(env, a) {
     const targets = a.opts.all ? ctx.tasks.filter((t) => !sm.isTerminal(t.status)) : [getTask(ctx, id)];
     const inflight = [];
     for (const t of targets) {
-      if (sm.IN_FLIGHT.includes(t.status)) inflight.push(t.task_id);
+      if (sm.IN_FLIGHT.includes(t.status)) {
+        inflight.push(t.task_id);
+        closeAttempt(t, 'cancelled', ctx.now, `cancelled: ${reason}`);
+      }
       move(ctx, t, 'CANCELLED', { reason });
     }
     persist(ctx, { command: 'cancel', tasks: targets.map((t) => t.task_id) });
@@ -1995,32 +2691,117 @@ function cmdResume(env, a) {
       return 1;
     }
     const ctx = openRun(env);
-    const requeued = [];
-    const notRequeued = [];
-    if (a.opts['requeue-running']) {
-      for (const t of ctx.tasks.filter((x) => sm.IN_FLIGHT.includes(x.status))) {
-        if (t.side_effects === 'external') {
-          notRequeued.push(`${t.task_id} (external side effects: check what its agent already did, then oo fail or oo block it)`);
-          continue;
-        }
-        const retries = t.retries || 0;
-        const lim = Object.assign({}, limits(ctx), { max_retries: retries + 1 });
-        const n = move(ctx, t, 'READY', { reason: 'requeued on resume: its agent is gone (no retry consumed)', limits: lim });
-        n.retries = retries;
-        requeued.push(`${t.task_id} (${t.status} -> READY)`);
-      }
+    const inflight = ctx.tasks.filter((t) => sm.IN_FLIGHT.includes(t.status));
+    if (a.opts['requeue-running'] && inflight.length) {
+      // Whether an agent is still working cannot be known from here: requeueing on a guess could
+      // run the same work twice and accept a stale report. Each attempt is reconciled explicitly.
+      refuse('nothing requeued', inflight.map((t) => `${t.task_id} attempt ${(t.dispatch && t.dispatch.attempt_id) || '?'} is ${t.status}; oo cannot tell whether its agent still runs`),
+        `for each attempt whose agent you know has stopped: oo reconcile <ID> --attempt <attempt id> --agent-gone --reason <text>; an agent that still runs reports with oo result as usual`);
     }
-    ctx.events.push({ type: 'resume', recovered: integ.recovered, problems: integ.problems, requeued });
+    const pending = [];
+    for (const t of ctx.tasks) {
+      if (t.pending_op) pending.push({ t, op: t.pending_op, st: store.ownerState(t.pending_op) });
+    }
+    if (ctx.run.pending_op) pending.push({ t: null, op: ctx.run.pending_op, st: store.ownerState(ctx.run.pending_op) });
+    ctx.events.push({ type: 'resume', recovered: integ.recovered, problems: integ.problems, in_flight: inflight.map((t) => (t.dispatch && t.dispatch.attempt_id) || t.task_id) });
     persist(ctx, { command: 'resume' });
     say(env, integ.recovered.length ? 'INTEGRITY: restored' : 'INTEGRITY: ok');
     for (const r of integ.recovered) say(env, `  restored from backup: ${r} (the backup holds the version before the last save; check that task's status below)`);
-    if (requeued.length) say(env, `REQUEUED: ${requeued.join(', ')}`);
-    if (notRequeued.length) say(env, `NOT REQUEUED: ${notRequeued.join('; ')}`);
-    const inflight = ctx.tasks.filter((t) => sm.IN_FLIGHT.includes(t.status)).map((t) => t.task_id);
-    if (inflight.length && !a.opts['requeue-running']) say(env, `In flight: ${inflight.join(', ')}. If their agents are gone, run oo resume --requeue-running.`);
+    if (inflight.length) {
+      say(env, 'In flight (their agents may still be working; their reports are accepted only for the attempt shown):');
+      for (const t of inflight) say(env, `  ${t.task_id} ${t.status} attempt ${(t.dispatch && t.dispatch.attempt_id) || '?'} dispatched ${t.dispatch && t.dispatch.at}${t.side_effects === 'external' ? ' (external side effects: check what its agent already did before anything else)' : ''}`);
+      say(env, '  If you know an attempt\'s agent has stopped: oo reconcile <ID> --attempt <attempt id> --agent-gone --reason <text> (no retry is used; a late report of that attempt is then refused).');
+    }
+    for (const p of pending) {
+      const what = p.t ? `${p.op.kind} of ${p.t.task_id}` : p.op.kind;
+      const advice = p.st === 'alive' ? 'still running; wait for it'
+        : p.st === 'dead' ? `interrupted (process ${p.op.pid} is gone); repeat oo ${p.op.kind === 'verify' ? 'verify' : p.op.kind === 'integrate' ? 'integrate' : 'deliver'}${p.t ? ` ${p.t.task_id}` : ''} to take it over`
+          : `started by process ${p.op.pid} on host ${p.op.host}, liveness unknown; after confirming it stopped, repeat with --takeover ${p.op.id}`;
+      say(env, `Operation ${what} (${p.op.id}): ${advice}`);
+    }
     const maxLines = Number.isInteger(ctx.cfg.context && ctx.cfg.context.max_resume_lines) ? ctx.cfg.context.max_resume_lines : 120;
     say(env, checkpoint.renderResume(checkpoint.buildCheckpoint(ctx.run, ctx.tasks, ctx.now), { maxLines }));
     say(env, `NEXT: ${firstNext(ctx, ctx.tasks.length ? 'oo final-report' : 'oo plan --file <specs.yaml>')}`);
+    return 0;
+  });
+}
+
+function cmdReconcile(env, a) {
+  cliargs.checkAllowed(a.opts, ['attempt', 'agent-gone', 'reason'], 'reconcile');
+  const id = a.pos[0];
+  if (!id || typeof a.opts.attempt !== 'string') usage('reconcile needs a task id and --attempt <attempt id>: oo reconcile <ID> --attempt <AID> --agent-gone --reason <text>');
+  if (a.opts['agent-gone'] !== true) usage('reconcile needs --agent-gone: state that you know this attempt\'s agent has stopped');
+  const reason = needReason(a);
+  return locked(env, () => {
+    const ctx = openRun(env);
+    const t = getTask(ctx, id);
+    const cur = t.dispatch && t.dispatch.attempt_id;
+    if (!sm.IN_FLIGHT.includes(t.status) || cur !== a.opts.attempt) {
+      refuse(`attempt ${a.opts.attempt} not reconciled`, `${id} is ${t.status}${cur ? ` and its current attempt is ${cur}` : ''}; only the current in-flight attempt can be reconciled (a finished result is kept)`, firstNext(ctx, 'oo status'));
+    }
+    if (t.side_effects === 'external') {
+      refuse(`attempt ${a.opts.attempt} not reconciled`, `${id} has external side effects; it is never requeued automatically`, `check what its agent already did, then oo fail ${id} --reason <text> or oo block ${id} --reason <text>`);
+    }
+    logAttempt(t, cur, 'abandoned', ctx.now, { reason });
+    touch(ctx, t);
+    const retries = t.retries || 0;
+    const lim = Object.assign({}, limits(ctx), { max_retries: retries + 1 });
+    const n = move(ctx, t, 'READY', { reason: `attempt ${cur} reconciled: its agent is gone (${reason}); no retry consumed`, limits: lim });
+    n.retries = retries;
+    n.next_dispatch_kind = 'retry';
+    ctx.events.push({ type: 'reconcile', task_id: id, attempt_id: cur, reason });
+    persist(ctx, { command: 'reconcile', task_id: id, attempt_id: cur });
+    say(env, `RECONCILED: ${id} attempt ${cur} abandoned -> READY (no retry used); a late report of that attempt is refused`, 'NEXT: oo next');
+    return 0;
+  });
+}
+
+function cmdRebaseline(env, a) {
+  cliargs.checkAllowed(a.opts, ['reason', 'user-authorized'], 'rebaseline');
+  const id = a.pos[0];
+  if (!id) usage('rebaseline needs a task id: oo rebaseline <ID> --reason <text> --user-authorized');
+  const reason = needReason(a);
+  if (a.opts['user-authorized'] !== true) {
+    refuse(`baseline of ${id} not reset`, 'NOT_AUTHORIZED: a new baseline accepts every change made since the old one as if it had been there before; only the user can decide that', 'ask the user; only when the user has said so, repeat with --user-authorized');
+  }
+  return locked(env, () => {
+    const ctx = openRun(env);
+    const t = getTask(ctx, id);
+    const allowed = ['PENDING', 'READY', 'BLOCKED', 'CORRECTION_REQUIRED', 'FAILED'];
+    if (!allowed.includes(t.status)) refuse(`baseline of ${id} not reset`, `${id} is ${t.status}; the baseline can be reset only in ${allowed.join(', ')}`, firstNext(ctx, 'oo status'));
+    if ((ctx.run.workspace || {}).strategy === 'worktree') refuse(`baseline of ${id} not reset`, 'the worktree strategy has no file baseline (its evidence is the git diff of the candidate)', 'oo status');
+    const old = t.baseline || null;
+    t.baseline = null;
+    t.history = (t.history || []).concat([{ ts: ctx.now, from: t.status, to: t.status, reason: `baseline reset by the user (${reason})${old ? `; previous baseline ${old.snapshot} of ${old.at}` : ''}`, actor: 'user' }]);
+    touch(ctx, t);
+    ctx.events.push({ type: 'rebaseline', task_id: id, reason, previous: old && old.snapshot });
+    persist(ctx, { command: 'rebaseline', task_id: id });
+    say(env, `BASELINE RESET: ${id}; the next dispatch takes a new baseline snapshot`, `NEXT: ${firstNext(ctx, 'oo next')}`);
+    return 0;
+  });
+}
+
+function cmdRepoGuard(env, a) {
+  cliargs.checkAllowed(a.opts, ['accept', 'reason', 'user-authorized'], 'repo-guard');
+  return locked(env, () => {
+    const ctx = openRun(env);
+    const ws = ctx.run.workspace || {};
+    if (ws.strategy !== 'worktree') {
+      say(env, 'REPO GUARD: shared workspace; the repository configuration is part of the snapshot evidence instead', 'NEXT: oo status');
+      return 0;
+    }
+    const now = gitops.repoGuard(ctx.paths.projectDir);
+    if (a.opts.accept === undefined) {
+      say(env, `REPO GUARD: ${now === ws.repo_guard ? 'unchanged since the run started' : 'CHANGED since the run started (verification, integration and delivery are refused)'}`, `  recorded ${ws.repo_guard}`, `  current  ${now}`, 'NEXT: oo status');
+      return 0;
+    }
+    const reason = needReason(a);
+    if (a.opts['user-authorized'] !== true) refuse('repository guard not updated', 'NOT_AUTHORIZED: accepting changed git configuration or hooks is the user\'s decision', 'ask the user; only when the user has said so, repeat with --user-authorized');
+    ctx.run.decisions.push({ ts: ctx.now, text: `repository configuration/hooks change accepted by the user: ${reason} (${ws.repo_guard} -> ${now})` });
+    ws.repo_guard = now;
+    ctx.events.push({ type: 'repo_guard', accepted: now, reason });
+    persist(ctx, { command: 'repo-guard', accepted: true });
+    say(env, 'REPO GUARD UPDATED (by user)', 'NEXT: oo status');
     return 0;
   });
 }
@@ -2061,72 +2842,160 @@ function cmdContext(env, a) {
 // ---------------------------------------------------------------------------
 
 function cmdDeliver(env, a) {
-  cliargs.checkAllowed(a.opts, [], 'deliver');
-  return locked(env, () => {
+  cliargs.checkAllowed(a.opts, ['takeover'], 'deliver');
+  const prep = locked(env, () => {
     const ctx = openRun(env);
     if (!ctx.tasks.length) refuse('nothing delivered', 'the run has no tasks', 'oo plan --file <specs.yaml>');
     const open = ctx.tasks.filter((t) => t.status !== 'COMPLETED' && t.status !== 'CANCELLED');
     if (open.length) {
       refuse('nothing delivered', open.map((t) => `${t.task_id} is ${t.status}`), 'finish, cancel or escalate those tasks first (oo status), or report the partial result with oo final-report');
     }
+    if (ctx.run.delivered) refuse('nothing delivered', `the run was already delivered at ${ctx.run.delivery && ctx.run.delivery.at}`, 'oo final-report');
+    const takeoverNote = opGate(ctx.run.pending_op, 'delivery', a.opts.takeover);
     const ws = ctx.run.workspace || {};
-    // Final audit: in a mode whose final_audit setting is true, the regression command runs on the
-    // integrated result before anything is delivered.
-    const mode = ((ctx.cfg.verification || {}).modes || {})[ctx.run.options.mode] || {};
-    let auditNote = null;
-    if (mode.final_audit === true) {
-      const rc = ctx.cfg.verification.regression_command;
-      if (!rc) {
-        auditNote = `FINAL AUDIT: mode ${ctx.run.options.mode} asks for a final audit, but no final audit command is configured (verification.regression_command is null); delivering without it`;
-      } else {
-        const cwd = ws.strategy === 'worktree' && integrationDir(ctx) ? integrationDir(ctx) : ctx.paths.projectDir;
-        const cr = verify.runCommands([rc], {
-          cwd, timeout_ms: (Number(ctx.cfg.execution.command_timeout_seconds) || 600) * 1000,
-          extraUnsafe: (ctx.cfg.security && ctx.cfg.security.extra_unsafe_patterns) || [],
-        });
-        const passed = cr.passed === true;
-        const evRel = store.writeEvidence(ctx.paths, ctx.run.run_id, 'final-audit.txt', evidenceText(
-          `Final audit of run ${ctx.run.run_id} (mode ${ctx.run.options.mode}, ${ws.strategy === 'worktree' ? 'integration worktree' : 'project directory'})`,
-          { at: ctx.now, cwd, shell: cr.shell, commands: cr.commands, passed }));
-        ctx.run.final_audit = { passed, run_at: ctx.now, command: rc, commands: cr.commands, evidence_file: evRel };
-        ctx.events.push({ type: 'final_audit', passed });
-        const evAbs = absProject(env, evRel);
-        if (!passed) {
-          persist(ctx, { command: 'deliver', outcome: 'final_audit_failed' });
-          say(env, 'FINAL AUDIT FAILED: nothing delivered', ...commandLines(cr.commands));
-          for (const c of cr.commands.filter((x) => x.refused || x.timed_out || x.exit_code !== 0)) {
-            say(env, `Failing command: ${c.command}`, `Exit code: ${c.refused ? 'refused' : c.timed_out ? 'timed out' : c.exit_code}`, 'Output tail:', ...indent(c.output_tail || '(no output)', '  | '));
-          }
-          say(env, `Evidence: ${evAbs}`, 'NEXT: find what broke the integrated result, fix it with a new task (oo plan --file <specs.yaml>) or ask the user; oo deliver runs the audit again');
-          return 1;
-        }
-        auditNote = `FINAL AUDIT PASSED: ${rc} (evidence ${evAbs})`;
+    let sha = null;
+    if (ws.strategy === 'worktree') {
+      checkRepoGuard(ctx, 'delivery');
+      if (!ws.integration_head) refuse('nothing delivered', 'this run predates integration-head tracking', `merge ${ws.integration_branch} yourself after checking it`);
+      const tip = gitops.revParse(ctx.paths.projectDir, `refs/heads/${ws.integration_branch}`);
+      if (tip !== ws.integration_head) {
+        const foreign = foreignIntegrationCommits(ctx, ws.integration_head, tip);
+        refuse('nothing delivered', `the integration branch ${ws.integration_branch} is at ${tip || '(missing)'}, but oo integrated up to ${ws.integration_head}${foreign.length ? `; commits oo did not make: ${foreign.join(', ')}` : ''}`,
+          'find out who moved the branch; nothing was forced. Deliver by hand after checking, or ask the user');
+      }
+      sha = ws.integration_head;
+    } else {
+      const changed = [];
+      for (const t of ctx.tasks.filter((x) => x.status === 'COMPLETED')) {
+        const files = t.evidence && t.evidence.integration && t.evidence.integration.files;
+        if (!files) continue;
+        const intact = sharedCandidateIntact(ctx, { files });
+        if (!intact.ok) changed.push(`${t.task_id}: ${intact.problem || intact.changed.join(', ')}`);
+      }
+      if (changed.length) {
+        refuse('nothing delivered: files changed after their integration', changed, 'find out what changed them (oo never reverts anything); re-run the affected tasks (oo reopen <ID> --reason <text> --user-authorized) or ask the user');
       }
     }
-    if (auditNote) say(env, auditNote);
-    if (ws.strategy === 'worktree') {
+    const mode = ((ctx.cfg.verification || {}).modes || {})[ctx.run.options.mode] || {};
+    const rc = ctx.cfg.verification.regression_command;
+    ctx.run.pending_op = newOp('deliver', { sha });
+    if (takeoverNote) ctx.run.decisions.push({ ts: ctx.now, text: `oo: ${takeoverNote}` });
+    persist(ctx, { command: 'deliver', phase: 'start', op: ctx.run.pending_op.id });
+    return {
+      opId: ctx.run.pending_op.id, sha, strategy: ws.strategy, audit: mode.final_audit === true, rc, modeName: ctx.run.options.mode,
+      setup: setupCommands(ctx), copts: commandOpts(ctx), policy: generated(ctx),
+    };
+  });
+
+  // Final audit outside the lock: on a clean checkout of exactly the commit to deliver (worktree)
+  // or in place with a before/after snapshot (shared).
+  let audit = null;
+  const notes = [];
+  if (prep.audit && prep.rc) {
+    const view = openRun(env);
+    if (prep.strategy === 'worktree') {
+      let dir = null;
+      try {
+        dir = cleanCheckout(view, 'audit', prep.sha);
+        const cr = runChecked(dir, prep.setup, [prep.rc], prep.copts);
+        let mutations = [];
+        let unreadable = null;
+        try {
+          mutations = checkoutMutations(dir, prep.policy);
+        } catch (e) {
+          unreadable = e.message;
+        }
+        const bad = mutations.filter((x) => !x.generated).map((x) => x.path);
+        audit = { cwd: dir, cr, mutations, passed: cr.passed === true && !bad.length && !unreadable, reasons: bad.length ? [`the audit command changed ${bad.join(', ')}`] : unreadable ? [unreadable] : null };
+        notes.push(`clean audit checkout ${relProject(env, dir)}: ${audit.passed ? dropCheckout(view, dir) : 'kept as evidence'}`);
+      } catch (e) {
+        audit = { cwd: dir, cr: { passed: null, shell: null, commands: [], env_removed: [] }, mutations: [], passed: false, reasons: [`the audit checkout could not be made: ${e.message}`] };
+      }
+    } else {
+      const root = env.paths.projectDir;
+      const pre = gitops.snapshot(root, { ignore: workspace.snapshotIgnore(env.paths) });
+      const cr = runChecked(root, prep.setup, [prep.rc], prep.copts);
+      const cmp = gitops.compareSnapshots(pre, gitops.snapshot(root, { ignore: workspace.snapshotIgnore(env.paths) }));
+      const mutations = cmp.ok ? cmp.changed.map((p) => ({ path: p, generated: workspace.isGenerated(p, prep.policy) })) : [];
+      const bad = mutations.filter((x) => !x.generated).map((x) => x.path);
+      audit = { cwd: root, cr, mutations, passed: cmp.ok && cr.passed === true && !bad.length, reasons: !cmp.ok ? cmp.problems : bad.length ? [`the audit command changed ${bad.join(', ')}`] : null };
+    }
+  }
+
+  return locked(env, () => {
+    const ctx = openRun(env);
+    if (!ctx.run.pending_op || ctx.run.pending_op.id !== prep.opId) {
+      refuse('delivery result discarded', `the delivery ${prep.opId} is no longer current`, firstNext(ctx, 'oo status'));
+    }
+    ctx.run.pending_op = null;
+    const ws = ctx.run.workspace || {};
+    if (prep.audit && !prep.rc) {
+      say(env, `FINAL AUDIT: mode ${prep.modeName} asks for a final audit, but no final audit command is configured (verification.regression_command is null); delivering without it`);
+    }
+    if (audit) {
+      const evRel = store.writeEvidence(ctx.paths, ctx.run.run_id, 'final-audit.txt', evidenceText(
+        `Final audit of run ${ctx.run.run_id} (mode ${prep.modeName}, ${prep.strategy === 'worktree' ? `clean checkout of ${prep.sha}` : 'project directory'})`,
+        { at: ctx.now, cwd: audit.cwd, shell: audit.cr.shell, commands: audit.cr.commands, passed: audit.passed, reasons: audit.reasons, envRemoved: audit.cr.env_removed, mutations: audit.mutations, notes }));
+      ctx.run.final_audit = { passed: audit.passed, run_at: ctx.now, command: prep.rc, commands: audit.cr.commands, evidence_file: evRel, commit: prep.sha };
+      ctx.events.push({ type: 'final_audit', passed: audit.passed });
+      const evAbs = absProject(env, evRel);
+      if (!audit.passed) {
+        persist(ctx, { command: 'deliver', outcome: 'final_audit_failed' });
+        say(env, 'FINAL AUDIT FAILED: nothing delivered', ...commandLines(audit.cr.commands), ...(audit.reasons || []).map((r) => `  - ${r}`));
+        for (const c of audit.cr.commands.filter((x) => x.refused || x.timed_out || (!x.skipped && x.exit_code !== 0))) {
+          say(env, `Failing command: ${c.command}`, `Exit code: ${c.refused ? 'refused' : c.timed_out ? 'timed out' : c.exit_code}`, 'Output tail:', ...indent(c.output_tail || '(no output)', '  | '));
+        }
+        say(env, `Evidence: ${evAbs}`, 'NEXT: find what broke the integrated result, fix it with a new task (oo plan --file <specs.yaml>) or ask the user; oo deliver runs the audit again');
+        return 1;
+      }
+      say(env, `FINAL AUDIT PASSED: ${prep.rc} (evidence ${evAbs})`);
+    }
+    if (prep.strategy === 'worktree') {
+      const failDelivery = (why, next) => {
+        persist(ctx, { command: 'deliver', outcome: 'refused' });
+        refuse('nothing delivered', why, next);
+      };
+      const tip = gitops.revParse(ctx.paths.projectDir, `refs/heads/${ws.integration_branch}`);
+      if (tip !== prep.sha) failDelivery(`the integration branch moved to ${tip} during the delivery; ${prep.sha} was audited`, 'find out who moved it; nothing was forced');
+      // The audit ran candidate code; a hook it planted would run inside the fast-forward below.
+      const guardNow = (() => { try { return gitops.repoGuard(ctx.paths.projectDir); } catch (e) { return `unreadable: ${e.message}`; } })();
+      if (ws.repo_guard && guardNow !== ws.repo_guard) {
+        failDelivery('the repository configuration, hooks or info files changed since the run started (possibly during the audit); nothing was moved', 'inspect .git/hooks, .git/config and .git/info, then oo repo-guard; only the user accepts such a change');
+      }
       const cur = gitops.git(['symbolic-ref', '--short', '-q', 'HEAD'], { cwd: ctx.paths.projectDir });
       const branch = cur.code === 0 ? cur.stdout.trim() : null;
       if (ws.base_branch && branch !== ws.base_branch) {
-        refuse('nothing delivered', `the main checkout is on ${branch || 'a detached HEAD'}, but the run started on ${ws.base_branch}`, `switch back to ${ws.base_branch} (or merge ${ws.integration_branch} yourself), then oo deliver`);
+        failDelivery(`the main checkout is on ${branch || 'a detached HEAD'}, but the run started on ${ws.base_branch}`, `switch back to ${ws.base_branch} (or merge ${prep.sha} yourself), then oo deliver`);
       }
-      const ff = gitops.fastForward(ctx.paths.projectDir, ws.integration_branch);
-      if (!ff.ok) {
-        refuse('nothing delivered: the fast-forward was not possible', ff.reason, `nothing was forced; ask the user how to bring ${ws.integration_branch} into ${ws.base_branch} (for example a manual merge)`);
+      let ops = [];
+      try {
+        ops = gitops.operationsInProgress(ctx.paths.projectDir);
+      } catch (e) {
+        failDelivery(`the main checkout cannot be inspected: ${e.message}`, 'fix the repository, then oo deliver');
       }
-      const head = gitops.git(['rev-parse', 'HEAD'], { cwd: ctx.paths.projectDir }).stdout.trim();
+      if (ops.length) failDelivery(`a git operation is unfinished in the main checkout: ${ops.join(', ')}`, 'finish or abort it yourself, then oo deliver');
+      const head = gitops.revParse(ctx.paths.projectDir, 'HEAD');
+      if (head !== prep.sha && !gitops.isAncestor(ctx.paths.projectDir, 'HEAD', prep.sha)) {
+        failDelivery(`${branch} and the integrated commit ${prep.sha} have diverged; a fast-forward is not possible`, `nothing was forced; ask the user how to bring ${prep.sha} into ${branch} (for example a manual merge)`);
+      }
+      if (head !== prep.sha) {
+        const ff = gitops.git(['merge', '--ff-only', prep.sha], { cwd: ctx.paths.projectDir });
+        if (ff.code !== 0) failDelivery(`the fast-forward to ${prep.sha} failed: ${(ff.stderr || ff.stdout).trim()}`, 'nothing was forced; resolve the cause in the main checkout (for example uncommitted changes to the same files), then oo deliver');
+      }
+      const after = gitops.revParse(ctx.paths.projectDir, 'HEAD');
+      if (after !== prep.sha) failDelivery(`after the fast-forward HEAD is ${after}, not ${prep.sha}`, 'inspect the main checkout');
       ctx.run.delivered = true;
-      ctx.run.delivery = { at: ctx.now, branch, head, from: ws.integration_branch };
-      ctx.events.push({ type: 'deliver', head });
+      ctx.run.delivery = { at: ctx.now, branch, head: after, from: ws.integration_branch, commit: prep.sha };
+      ctx.events.push({ type: 'deliver', head: after });
       persist(ctx, { command: 'deliver' });
-      say(env, `DELIVERED: ${branch} fast-forwarded to ${head} (${ws.integration_branch}); uncommitted files in the main checkout were not touched`, 'NEXT: oo final-report, then oo cleanup');
+      say(env, `DELIVERED: ${branch} fast-forwarded to ${after} (exactly the integrated and audited commit of ${ws.integration_branch}); uncommitted files in the main checkout were not touched`, 'NEXT: oo final-report, then oo cleanup');
       return 0;
     }
     ctx.run.delivered = true;
     ctx.run.delivery = { at: ctx.now, branch: null, head: null, from: null };
     ctx.events.push({ type: 'deliver' });
     persist(ctx, { command: 'deliver' });
-    say(env, 'DELIVERED: shared workspace, the changes are already in place; nothing to move', 'NEXT: oo final-report');
+    say(env, 'DELIVERED: shared workspace, the changes are already in place (each integrated file still has its integrated content); nothing to move', 'NEXT: oo final-report');
     return 0;
   });
 }
@@ -2324,10 +3193,12 @@ function cmdDoctor(env, a) {
     isolation = configLib.loadConfig({ skillDir: SKILL_DIR, stateConfigFile: env.paths.configFile }).execution.isolation;
   } catch (_) { /* default */ }
   const sh = verify.findShell();
+  const gv = gitops.gitVersion();
+  const gitOld = gv && !(gv[0] > 2 || (gv[0] === 2 && gv[1] >= 31));
   say(env,
     `DOCTOR (opus-orchestrator ${readVersion()})`,
     `Node: ${process.version}`,
-    `git: ${gitV || 'not found'}`,
+    `git: ${gitV || 'not found'}${gitOld ? ' (older than 2.31: the worktree strategy is not used)' : ''}`,
     `Claude Code: ${claudeV || 'not found on PATH'}`,
     `Project: ${env.paths.projectDir}`,
     `Workspace strategy: ${gitops.chooseStrategy(info, isolation)} (${info.is_repo ? `git repository${info.has_commits ? `, branch ${info.branch || 'detached'}` : ', no commits'}` : 'no git repository'})`,
@@ -2366,13 +3237,13 @@ const HELP = [
   '  plan --file F | --stdin            validate, route and save task specifications (nothing is saved on any error)',
   '  next [--inline]                    dispatch ready tasks: Agent calls plus a short prompt naming the package file',
   '  started <ID> [<ID>...]             DISPATCHED -> RUNNING after the agents were launched',
-  '  result <ID> --stdin [--tokens N] [--worktree P --branch B] [--verify]',
-  '  verify <ID>                        run the verification commands and the scope check',
+  '  result <ID> --stdin [--tokens N] [--worktree P] [--agent-id A] [--verify]   the report must carry the attempt_id of its package',
+  '  verify <ID> [--takeover OP]        run the verification commands (clean checkout or snapshot) and the scope check',
   '  check <ID> --name N --result pass|fail --note T',
   '  review-package <ID> [--inline]     independent reviewer call and package',
-  '  review <ID> --stdin [--integrate]  record a review; reviewer orchestrator is your own quality gate',
+  '  review <ID> --stdin [--agent-id A] [--integrate]  record a review (independent: its review_id and the reviewer agent id); reviewer orchestrator is your own gate',
   '  correct <ID> --stdin               correction request (bounded by max_review_rounds) -> READY',
-  '  integrate <ID>                     merge (worktree) or re-check (shared) -> COMPLETED',
+  '  integrate <ID> [--takeover OP]     merge the verified candidate in a clean checkout, check that commit, fast-forward the integration branch (worktree) or re-check (shared) -> COMPLETED',
   '  worker-failed <ID> --kind crash|invalid_output|permission|rate_limit|context|timeout|tool|budget --reason T',
   '  escalate <ID> --model M | --role R --reason T',
   '  amend <ID> --file F --reason T',
@@ -2381,8 +3252,12 @@ const HELP = [
   '  authorize --limit agent_call_limit|token_limit|cost_limit_usd|max_review_rounds|max_retries --value V --by user --reason T',
   '  authorize --task <ID> --side-effects --by user --reason T',
   '  usage --tokens N [--task ID] | --cost USD',
-  '  status [--json]   checkpoint   resume [--requeue-running]   context [--utilization X]',
-  '  deliver   final-report   cleanup',
+  '  reconcile <ID> --attempt AID --agent-gone --reason T   an in-flight attempt whose agent is known to have stopped -> READY',
+  '  review-abandon <ID> --review RID --reason T   a lost reviewer; its late report is refused',
+  '  rebaseline <ID> --reason T --user-authorized   shared workspace: take a new baseline at the next dispatch',
+  '  repo-guard [--accept --reason T --user-authorized]   git configuration/hooks unchanged since init (worktree strategy)',
+  '  status [--json]   checkpoint   resume   context [--utilization X]',
+  '  deliver [--takeover OP]   final-report   cleanup',
   '  observe --category C --text T [--task ID]   learn',
   '  proposals [list | show ID | approve ID --by user | reject ID | apply ID | rollback ID]',
   '  doctor   version   help',
@@ -2409,6 +3284,10 @@ const COMMANDS = {
   review: cmdReview,
   correct: cmdCorrect,
   integrate: cmdIntegrate,
+  'review-abandon': cmdReviewAbandon,
+  reconcile: cmdReconcile,
+  rebaseline: cmdRebaseline,
+  'repo-guard': cmdRepoGuard,
   'worker-failed': cmdWorkerFailed,
   escalate: cmdEscalate,
   amend: cmdAmend,
@@ -2450,6 +3329,7 @@ function main(argv) {
   const env = makeEnv();
   let code;
   const cmd = argv[0];
+  env.command = typeof cmd === 'string' ? cmd : null;
   try {
     if (!cmd || cmd === '--help' || cmd === '-h') code = cmdHelp(env);
     else if (cmd === 'init') code = cmdInit(env, argv.slice(1));
@@ -2466,7 +3346,14 @@ function main(argv) {
       say(env, `USAGE ERROR: ${e.message}`, 'NEXT: oo help lists every command and its options');
       code = 2;
     } else if (e && e.code === 'LOCK_TIMEOUT') {
-      say(env, formatRefusal(new Refusal('command not run', 'another oo process holds the state lock', 'wait for it to finish and repeat the command')));
+      const unprovable = e.lockState !== 'ok' || store.ownerState(e.owner) === 'unknown';
+      say(env, formatRefusal(new Refusal('command not run', e.message,
+        unprovable
+          ? 'the lock owner cannot be proven alive or dead; inspect it with node manage_state.cjs lock and break it only after confirming no oo process of this project runs'
+          : 'wait for that oo command to finish and repeat this one (a lock is never taken from a live owner)')));
+      code = 1;
+    } else if (e && (e.code === 'LOCK_LOST' || e.code === 'LOCK_RECONCILIATION_REQUIRED' || e.code === 'LOCK_REENTRANT')) {
+      say(env, formatRefusal(new Refusal('state lock problem', `${e.code}: ${e.message}`, 'node manage_state.cjs lock, then oo resume')));
       code = 1;
     } else {
       say(env, `ERROR: ${e && e.code ? `${e.code}: ` : ''}${e && e.message ? e.message : String(e)}`,

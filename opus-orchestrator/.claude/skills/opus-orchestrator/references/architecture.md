@@ -35,7 +35,7 @@ Markdown instructions alone cannot schedule, monitor or persist anything. Every 
 
 ## One command's life
 
-Every state-changing command: acquire the lock (`.claude/opus-orchestrator/.lock`; a lock older than 30 seconds or held by a dead process is treated as stale) -> load `run.json` and the task files -> change tasks through `statemachine.transition` (an illegal move is refused with its code, for example `INVALID_TRANSITION`) -> save changed tasks and the run -> append events -> rewrite `checkpoint.yaml` -> release the lock. Commands that run verification or integration commands release the lock while the commands run and take it again to record the result, and discard the result if the task moved meanwhile. `oo deliver` is different: its final audit runs while the lock is held.
+Every state-changing command: acquire the lock (`.claude/opus-orchestrator/.lock`, an owner record with a unique token, process id and host, published complete with a hard link; taken over only when the owner is proven dead on the same host, never because of its age) -> load `run.json` and the task files -> change tasks through `statemachine.transition` (an illegal move is refused with its code, for example `INVALID_TRANSITION`) -> check the lock is still held -> save changed tasks and the run -> append events -> rewrite `checkpoint.yaml` -> release the lock only if it still carries this command's token. Verification, integration and delivery record an operation (id and owner) under the lock, run their commands without it, and take it again to apply the result only if that operation is still current; otherwise the result is discarded. The PreCompact hook writes its checkpoint under the lock too.
 
 ## State layout
 

@@ -25,9 +25,16 @@ Put the commands in the contract's `verification_commands`. Prefer the narrowest
 
 ## What `fo verify` does
 
-1. Runs `verification_commands` in a fresh detached checkout of the accepted candidate commit for Git tasks, under bash where available, with the configured timeout. Output and exit code go to `evidence/<ID>-c<cycle>-v<n>.log`.
+1. Runs `verification_commands` in a fresh detached checkout of the accepted candidate commit for Git tasks, under bash where available, with the configured timeout. Output and exit code go to `evidence/<ID>-c<cycle>-<operation>-v<n>.log`, where `<operation>` is the first eight characters of that verification run's ID. The check record in `state.json` names the file and its SHA-256 digest. A log that no check record names, such as one left by an interrupted run, is not evidence.
 2. Compares the files actually changed (from git, or from the tree fingerprint in a shared workspace) with the contract's `file_scope`. A file outside the scope is a failed check.
-3. Decides: every check passed and at least one command or manual check exists gives REVIEWING; any failure gives CORRECTION_REQUIRED; nothing verifiable is an error that leaves the task in VERIFYING until a check is recorded or the task is blocked as unverified.
+3. Checks that every manual check of the cycle was recorded against the content being verified: the candidate commit for Git tasks, the complete content snapshot in a shared workspace. A manual check recorded against other content fails as `manual check freshness`.
+4. Decides: every check passed and at least one command or manual check exists gives REVIEWING; any failure gives CORRECTION_REQUIRED; nothing verifiable is an error that leaves the task in VERIFYING until a check is recorded or the task is blocked as unverified.
+
+### Continuing and restarting a cycle
+
+- `fo verify <ID>` in VERIFYING continues the open cycle. It keeps the cycle's manual checks and, in a shared workspace, compares the content with the cycle's pending snapshot (or the report snapshot). Changed content fails the cycle.
+- `fo verify <ID> --reverify --reason "..."` is accepted only from REVIEWING or CORRECTION_REQUIRED. It opens a new cycle with no checks and consumes a correction round. From REVIEWING it is refused while a reviewer dispatch of the current cycle is active or of unknown liveness. In IMPLEMENTED or VERIFYING it is refused, so it can never keep old manual checks while skipping the content comparison.
+- A manual-only re-verification ends with `NO_VERIFICATION_EVIDENCE` and leaves the new cycle waiting. Record the manual checks against the current content, then run `fo verify <ID>`.
 
 `fo integrate` repeats the task's commands on the merged tree. If the detached merged candidate fails, the task returns to CORRECTION_REQUIRED and the integration branch stays at its previous commit.
 

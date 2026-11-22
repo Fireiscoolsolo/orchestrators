@@ -34,11 +34,12 @@ function quoteYaml(s) {
 }
 
 /** The report block of DESIGN 3.4 for a task, with one self_check entry per criterion. */
-function resultTemplate(task) {
+function resultTemplate(task, attemptId) {
   const n = (task.acceptance_criteria || []).length;
   const lines = [
     '```yaml',
     `task_id: ${task.task_id}`,
+    `attempt_id: '${attemptId || 'the attempt id of your package'}'   # copy exactly; a report without the current attempt id is refused`,
     'status: completed            # completed|failed|blocked|needs_decomposition',
     "summary: 'one or two sentences on what you did'",
     'files_changed: []            # every file you created, modified or deleted',
@@ -60,11 +61,12 @@ function resultTemplate(task) {
 }
 
 /** The review report block of DESIGN 3.5. */
-function reviewTemplate(task, reviewer) {
+function reviewTemplate(task, reviewer, reviewId) {
   const n = (task.acceptance_criteria || []).length;
   const lines = [
     '```yaml',
     `task_id: ${task.task_id}`,
+    `review_id: '${reviewId || 'the review id of your package'}'   # copy exactly; a report without it is refused`,
     `reviewer: ${reviewer}`,
     'verdict: approve             # approve|request_changes|reject',
     `criteria:                    # exactly ${n} entr${n === 1 ? 'y' : 'ies'}, one per acceptance criterion, in order`,
@@ -191,7 +193,7 @@ function workerPackage(task, opts) {
   out.push('## Report format');
   out.push('End your final message with exactly one fenced yaml block in this shape. It must be the last thing in the message.');
   out.push(REPORT_QUOTING);
-  out.push(...resultTemplate(task));
+  out.push(...resultTemplate(task, o.attemptId));
   return out.join('\n') + '\n';
 }
 
@@ -206,12 +208,15 @@ function reviewPackage(task, opts) {
   const out = [];
   out.push(`REVIEW TASK ${task.task_id}: ${task.title}`, '');
   out.push('## Role', 'You are an independent reviewer. You did not write this change. Judge the change itself against each acceptance criterion, not the author\'s description of it. Do not modify any file.', '');
+  if (o.reviewId) out.push(`Review id: ${o.reviewId}${o.candidate ? ` (candidate ${o.candidate})` : ''}. Your report must carry this review_id.`, '');
   out.push('## Objective', task.objective, '');
   out.push('## Acceptance criteria', ...numbered(task.acceptance_criteria), '');
   const scope = task.authorized_files || [];
   out.push('## Authorized files', ...(scope.length ? scope.map((f) => `- ${f}`) : ['Read-only task: no file should have changed.']), '');
   out.push('## What changed');
-  if (ch.kind === 'diff') {
+  if (ch.kind === 'pinned') {
+    out.push(`Read the pinned evidence file ${ch.file}: the exact diff (or, without git, the exact content) of the verified candidate. You have no shell, so do not try to run commands; the orchestrator's command output is in the evidence files below. Judge that pinned content, not the working tree, which may have moved on.`);
+  } else if (ch.kind === 'diff') {
     out.push(`In ${ch.cwd} run: ${ch.command}`);
   }
   if ((ch.files || []).length) {
@@ -230,7 +235,7 @@ function reviewPackage(task, opts) {
   out.push('## Report format');
   out.push('End your final message with exactly one fenced yaml block in this shape. It must be the last thing in the message.');
   out.push(REPORT_QUOTING);
-  out.push(...reviewTemplate(task, reviewer));
+  out.push(...reviewTemplate(task, reviewer, o.reviewId));
   return out.join('\n') + '\n';
 }
 

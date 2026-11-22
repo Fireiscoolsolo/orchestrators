@@ -18,6 +18,9 @@ For every failure: keep the evidence, record the state, decide whether a retry i
 | Git conflict at integration | `fo integrate` reports CONFLICT | correction: merge the integration tip and resolve, usually with `assign_role: integration-worker` | merge aborted, integration branch untouched, CORRECTION_REQUIRED |
 | Regression after merging | an integration command fails on the merged tree | correction against the merged behaviour | merge aborted, CORRECTION_REQUIRED |
 | Partial integration | interrupted during `fo integrate` | Inspect the operation and its checkout, then use `fo reconcile <ID> --reason ...` | preserves the checkout and retains the operation until reconciled |
+| Interrupted dispatch | `fo next` failed or was stopped after creating a worktree but before saving state | run `fo next` again | takes over the unrecorded run worktree only when it is unmodified, on its branch, at the intended start commit; otherwise refuses with WORKTREE_CONFLICT and leaves it untouched |
+| Interrupted state commit | a command failed after doing its work but before saving state | rerun the command | state is unchanged. Record copies and review diffs are written only after a commit. Command logs from the interrupted run carry its operation ID and are named by no check record |
+| Review diff not written | `fo review-package` reports EVIDENCE_WRITE_FAILED | fix the disk problem, then run `fo review-package <ID>` again | the dispatch, whose prompt was never printed, is recorded as failed and its agent call returned |
 | Interrupted run | session ended, crashed, or context was compacted | `/fable-orchestrator --resume` or `fo resume` | see below |
 | Corrupted state | `fo` warns that `state.json` is unreadable | `fo recover`, then `fo resume` | see below |
 | Budget reached | `fo next` prints BUDGET LIMIT | ask the user; `fo authorize --extra-agent-calls N --by user --reason "..."` | no dispatch until authorized |
@@ -38,7 +41,7 @@ Every failure is appended to the task's `failures` list and the event log, and a
 `fo resume` (also reached through `/fable-orchestrator --resume`):
 
 - DISPATCHED or RUNNING tasks retain their attempt while the host status is unknown. Record failure with its UUID once the host confirms it ended.
-- An interrupted verifier or integrator is retained until `fo reconcile <ID> --reason ...` confirms the CLI operation is no longer active. Reconcile Git state manually first if needed.
+- An interrupted verifier or integrator is retained until `fo reconcile <ID> --reason ...` confirms the CLI operation is no longer active. Reconcile Git state manually first if needed. Operations record their host; reconcile one from the host that started it, because a process ID says nothing about another machine.
 - An interrupted final delivery uses `fo reconcile RUN --reason ...` after checking the destination checkout.
 - A plan-only run that was accepted starts executing.
 - It prints the original request, recorded decisions, every task's state and the open actions.

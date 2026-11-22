@@ -70,26 +70,32 @@ function task(id, status, files, history) {
   return { task_id: id, status, authorized_files: files, history: history || [{ ts: '2026-01-01T00:00:00.000Z', from: null, to: status }] };
 }
 
-test('attributeShared: own scope, other in-flight task scope, and violations', () => {
+test('regression: attributeShared never attributes by another task\'s scope, only by content its verified candidate recorded', () => {
   const since = '2026-01-01T00:00:05.000Z';
-  const me = task('A-001', 'IMPLEMENTED', ['src/a/']);
-  const other = task('B-001', 'RUNNING', ['src/b.txt']);
-  const doneBefore = task('C-001', 'COMPLETED', ['docs/'], [
-    { ts: '2026-01-01T00:00:00.000Z', from: null, to: 'PENDING' },
-    { ts: '2026-01-01T00:00:01.000Z', from: 'INTEGRATING', to: 'COMPLETED' },
-  ]);
-  const doneAfter = task('D-001', 'COMPLETED', ['lib/'], [
-    { ts: '2026-01-01T00:00:00.000Z', from: null, to: 'PENDING' },
-    { ts: '2026-01-01T00:00:03.000Z', from: 'READY', to: 'DISPATCHED' },
-    { ts: '2026-01-01T00:00:09.000Z', from: 'INTEGRATING', to: 'COMPLETED' },
-  ]);
-  const r = ws.attributeShared(me, ['src/a/x.js', 'src/b.txt', 'docs/readme.md', 'lib/util.js', 'stray.txt'], [me, other, doneBefore, doneAfter], since);
+  const me = task('A-001', 'IMPLEMENTED', ['src/a/', 'src/odd*']);
+  // B is in flight and its scope covers src/b.txt and lib/: that alone proves nothing.
+  const other = task('B-001', 'RUNNING', ['src/b.txt', 'lib/']);
+  // C verified a candidate that recorded src/c.txt with a known content hash.
+  const verified = task('C-001', 'REVIEWING', ['src/c.txt']);
+  verified.evidence = { verification: { passed: true, run_at: '2026-01-01T00:00:04.000Z', candidate: { kind: 'shared', files: { 'src/c.txt': 'sha256:cc', 'src/gone.txt': null } } } };
+  const current = { version: 2, root: '/p', complete: true, errors: [], odd: ['src/odd\nname'],
+    files: { 'src/a/x.js': 'sha256:aa', 'src/b.txt': 'sha256:bb', 'lib/util.js': 'sha256:uu', 'src/c.txt': 'sha256:cc', 'coverage/lcov.info': 'sha256:ll', 'stray.txt': 'sha256:ss', 'src/odd\nname': 'sha256:oo' } };
+  const cmp = { ok: true, problems: [], changed: ['coverage/lcov.info', 'lib/util.js', 'src/a/x.js', 'src/b.txt', 'src/c.txt', 'src/gone.txt', 'src/odd\nname', 'stray.txt'].sort() };
+  const r = ws.attributeShared(me, cmp, current, { tasks: [me, other, verified], generated: ['coverage/'] });
   assert.deepEqual(r.own, ['src/a/x.js']);
-  assert.deepEqual(r.ignored, [{ file: 'src/b.txt', owner: 'B-001' }, { file: 'lib/util.js', owner: 'D-001' }]);
-  assert.deepEqual(r.violations, ['docs/readme.md', 'stray.txt']);
+  assert.deepEqual(r.generated, ['coverage/lcov.info']);
+  assert.deepEqual(r.ignored.map((x) => [x.file, x.owner]), [['src/c.txt', 'C-001'], ['src/gone.txt', 'C-001']]);
+  assert.match(r.ignored[0].basis, /content recorded by the verified candidate of C-001/);
+  assert.deepEqual(r.violations.sort(), ['lib/util.js', 'src/b.txt', 'src/odd\nname', 'stray.txt'].sort(), 'in-flight B\'s scope does not excuse b.txt or lib/; an odd name is never matched by a scope');
   assert.equal(r.ok, false);
-  assert.equal(ws.statusAt(doneAfter, since), 'DISPATCHED');
-  assert.equal(ws.ownedWorkSince(doneBefore, since), false);
+
+  // Same path, different content than C recorded: a violation.
+  const tampered = Object.assign({}, current, { files: Object.assign({}, current.files, { 'src/c.txt': 'sha256:other' }) });
+  assert.ok(ws.attributeShared(me, { ok: true, problems: [], changed: ['src/c.txt'] }, tampered, { tasks: [verified] }).violations.includes('src/c.txt'));
+  // Incomplete evidence is never read as "no change".
+  assert.throws(() => ws.attributeShared(me, { ok: false, problems: ['the current snapshot is incomplete: src (EACCES)'], changed: [] }, current, {}), (e) => e.code === 'EVIDENCE_INCOMPLETE');
+  assert.equal(ws.statusAt(other, since), 'RUNNING');
+  assert.equal(ws.ownedWorkSince(task('D-001', 'COMPLETED', [], [{ ts: '2026-01-01T00:00:01.000Z', from: 'INTEGRATING', to: 'COMPLETED' }]), since), false);
 });
 
 test('snapshotIgnore lists git data, node_modules, agent worktrees, the state directory and the inbox', () => {

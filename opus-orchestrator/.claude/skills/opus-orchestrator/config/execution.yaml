@@ -39,3 +39,7 @@ security:
     - "id_rsa*"
     - "*credentials*"
     - "*secret*"
+  # Verification commands run without environment variables whose names look like credentials
+  # (TOKEN, SECRET, PASSWORD, API_KEY, AWS_SECRET_ACCESS_KEY, GH_TOKEN and similar). List a name
+  # here only if a check really needs it. This is a limited safeguard, not a sandbox.
+  command_env_allow: []

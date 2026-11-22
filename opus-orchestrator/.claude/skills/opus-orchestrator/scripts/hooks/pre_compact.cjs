@@ -3,20 +3,28 @@
 // plain instructions for the compaction summary. Never blocks compaction: always exits 0.
 const path = require('node:path');
 const checkpoint = require('../lib/checkpoint.cjs');
+const store = require('../lib/store.cjs');
 const common = require('./_common.cjs');
 
 function main(payload) {
   if (!payload) return '';
   const paths = common.locatePaths([payload.cwd]);
-  const { run, tasks } = common.loadCurrent(paths);
+  let { run, tasks } = common.loadCurrent(paths);
   if (!checkpoint.isUnfinished(tasks)) return '';
 
   const cfgCtx = (run.config && run.config.context) || {};
-  const cp = checkpoint.buildCheckpoint(run, tasks, new Date());
+  let cp = checkpoint.buildCheckpoint(run, tasks, new Date());
   let written = false;
   if (cfgCtx.checkpoint_before_compaction !== false) {
+    // The checkpoint is written under the state lock, from state read under it, so it never
+    // interleaves with an oo command's writes. A busy lock is waited for briefly; if it stays
+    // busy the checkpoint oo itself wrote after its last change stands, and compaction goes on.
     try {
-      checkpoint.writeCheckpoint(paths, run.run_id, cp);
+      store.withLock(paths, () => {
+        ({ run, tasks } = common.loadCurrent(paths));
+        cp = checkpoint.buildCheckpoint(run, tasks, new Date());
+        checkpoint.writeCheckpoint(paths, run.run_id, cp);
+      }, { waitMs: 2000, kind: 'hook', command: 'pre_compact' });
       written = true;
     } catch (e) {
       common.logErr('pre_compact', e);

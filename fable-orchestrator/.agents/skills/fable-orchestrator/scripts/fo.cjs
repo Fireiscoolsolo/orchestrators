@@ -460,6 +460,27 @@ function cmdPlan(args) {
 
 // -------------------------------------------------------------- dispatch
 
+/**
+ * Create a run-owned worktree on a deterministic branch inside the run directory. `git worktree add`
+ * runs inside the state transaction, so a failed or interrupted commit leaves the branch and
+ * worktree behind without any state naming them. A retry takes over exactly that leftover: same
+ * repository, registered path, branch at the intended start commit, nothing modified. Anything else
+ * is refused for manual reconciliation.
+ */
+function addRunWorktree(root, dir, branch, start) {
+  if (!gitops.branchExists(root, branch) && !fs.existsSync(dir)) {
+    gitops.worktreeAdd(root, dir, { branch, start });
+    return;
+  }
+  const leftover = gitops.branchExists(root, branch) && gitops.revParse(root, branch) === start &&
+    gitops.isWorktree(dir) && sameRepo(root, dir) && gitops.currentBranch(dir) === branch &&
+    gitops.revParse(dir, 'HEAD') === start && !gitops.dirtyFiles(dir).length &&
+    gitops.registeredWorktrees(root).some((p) => gitops.samePath(p, dir));
+  if (!leftover) {
+    throw new OrchError('WORKTREE_CONFLICT', `${branch} or ${dir} already exists but is not an unmodified worktree left by an interrupted dispatch of this run; inspect and remove it before retrying`);
+  }
+}
+
 function ensureIntegration(state, c) {
   const g = state.project.git;
   if (!g) return;
@@ -477,7 +498,7 @@ function ensureIntegration(state, c) {
   }
   const branch = `fable/${state.run_id}/integration`;
   const dir = path.join(c.runDir, 'integration');
-  gitops.worktreeAdd(root, dir, { branch, start: head });
+  addRunWorktree(root, dir, branch, head);
   g.base_sha = head;
   g.integration_branch = branch;
   g.integration_path = dir;
@@ -512,7 +533,7 @@ function newAttempt(state, c, t) {
       a.isolation = 'managed';
       a.branch = `fable/${state.run_id}/${t.id}-a${n}`;
       a.workdir = path.join(c.runDir, 'wt', `${t.id}-a${n}`);
-      gitops.worktreeAdd(root, a.workdir, { branch: a.branch, start: a.start_refs[0] });
+      addRunWorktree(root, a.workdir, a.branch, a.start_refs[0]);
       a.worktree_path = a.workdir;
       a.ownership = 'managed';
     } else {
@@ -527,9 +548,14 @@ function newAttempt(state, c, t) {
       // A retry must not legitimize unauthorized edits left by an earlier attempt.
       sharedBaseline(first);
       a.snapshot = first.snapshot;
+      if (first.snapshot_sha256) a.snapshot_sha256 = first.snapshot_sha256;
     } else {
+      // Later commands read this baseline, so it is written before the commit and bound by digest:
+      // a file left by a commit that failed is never named by state.
+      const text = JSON.stringify(snap);
       a.snapshot = path.join(c.runDir, 'snapshots', `${t.id}-a${n}.fs.json`);
-      fs.writeFileSync(a.snapshot, JSON.stringify(snap));
+      a.snapshot_sha256 = sha256(text);
+      sm.writeAtomic(a.snapshot, text);
     }
   }
   t.attempts.push(a);
@@ -629,11 +655,22 @@ function cmdNext(args) {
     const cap = Math.min(state.options.max_workers, routing.MODES[state.options.mode].parallel_cap);
     let picked = { selected: [], deferred: [] };
     if (!budget.exceeded) {
-      picked = sched.selectBatch(sm.schedulerViews(state), { maxWorkers: cap, maxNew: budget.remaining_calls });
+      let views = sm.schedulerViews(state);
+      const held = [];
+      // A started, unfinished task owns a shared workspace even while BLOCKED or waiting for a
+      // retry: its partial edits sit in the files, and its retries compare against its first
+      // baseline, so work integrated by another task in between would read as out-of-scope edits.
+      // Other READY tasks are withheld before selection, so they can never take the owner's slot.
+      const owner = state.project.git ? null
+        : state.order.map((x) => state.tasks[x]).find((t) => t.attempts.length > 0 && !sm.TERMINAL.includes(t.state));
+      if (owner) {
+        for (const v of views) if (v.id !== owner.id && v.state === 'READY') held.push(v.id);
+        views = views.filter((v) => !held.includes(v.id));
+      }
+      picked = sched.selectBatch(views, { maxWorkers: cap, maxNew: budget.remaining_calls });
+      for (const x of held) picked.deferred.push({ id: x, reason: `shared workspace is held by ${owner.id} (${owner.state}) until it completes, fails or is cancelled` });
       if (!state.project.git) {
-        const held = Object.values(state.tasks).find((t) => sm.HOLD_STATES.includes(t.state));
-        const allowed = held ? 0 : 1;
-        for (const id of picked.selected.splice(allowed)) picked.deferred.push({ id, reason: 'shared workspace requires one active task at a time' });
+        for (const x of picked.selected.splice(1)) picked.deferred.push({ id: x, reason: 'shared workspace requires one active task at a time' });
       }
       if (picked.selected.length) ensureIntegration(state, c);
     }
@@ -825,8 +862,9 @@ function cmdReport(args) {
       throw new OrchError('INVALID_REPORT', [`${id}: completion report rejected (state unchanged):`].concat(errors.map((e) => `  - ${e}`),
         [`Fix the report and resubmit, or after confirming the worker stopped record: fo worker-failed ${id} --attempt-id ${a.attempt_id} --kind invalid_output --reason "..."`]).join('\n'));
     }
-    fs.writeFileSync(path.join(c.runDir, 'reports', `${id}-d${a.n}.yaml`), yaml.dump(r));
+    const copy = recordFile(path.join('reports', `${id}-d${a.n}.yaml`), yaml.dump(r));
     a.report = r;
+    a.report_record = { file: copy.file, sha256: copy.sha256 };
     a.reconciliation_required = false;
     a.reported_at = nowIso();
     const tokens = Number(args.flags.tokens);
@@ -845,8 +883,9 @@ function cmdReport(args) {
     } else {
       workerFailure(state, c, t, 'worker_reported_failure', r.reason || r.known_issues.join('; '));
     }
-    return { state: t.state, warnings, commit: a.commit, files: a.changed_files };
+    return { state: t.state, warnings, commit: a.commit, files: a.changed_files, copy };
   });
+  writeRecords(c, [res.copy]);
   const L = [`${id}: report accepted -> ${res.state}${res.commit ? ` (commit ${short(res.commit)}, ${res.files.length} changed file(s))` : ''}`];
   for (const w of res.warnings) L.push(`  note: ${w}`);
   console.log(L.join('\n'));
@@ -878,16 +917,38 @@ const tail = (s, lines, chars) => {
   return t.length > chars ? t.slice(-chars) : t;
 };
 
-function runAndRecord(c, id, cycle, tag, cmd, cwd, timeoutMs) {
+const sha256 = (data) => crypto.createHash('sha256').update(data).digest('hex');
+const recordFile = (file, text) => ({ file: file.replace(/\\/g, '/'), text, sha256: sha256(text) });
+
+/**
+ * reports/, reviews/ and corrections/ hold copies of records a transaction accepted. They are
+ * written only after that transaction commits, so a failed or interrupted commit never leaves a
+ * file that looks accepted. state.json stays authoritative: every record names its file and
+ * SHA-256 digest, and a file that state does not name is not evidence.
+ */
+function writeRecords(c, records) {
+  for (const r of records) {
+    try { sm.writeAtomic(path.join(c.runDir, r.file), r.text); } catch (e) {
+      console.error(`WARNING [RECORD_COPY_MISSING]: state was committed, but its copy ${r.file} could not be written (${e.message}); state.json remains authoritative`);
+    }
+  }
+}
+
+/**
+ * Command evidence is written while checks run, before the transaction that records them. Each
+ * file name carries the operation ID, so output from an interrupted or rejected run can never be
+ * taken for a later accepted check; only a check record in state, with its digest, accepts a log.
+ */
+function runAndRecord(c, id, cycle, op, tag, cmd, cwd, timeoutMs) {
   const r = gitops.runCommand(cmd, cwd, timeoutMs);
-  const rel = path.join('evidence', `${id}-c${cycle}-${tag}.log`);
+  const rel = path.join('evidence', `${id}-c${cycle}-${String(op).slice(0, 8)}-${tag}.log`);
   const body = [`command: ${cmd}`, `cwd: ${cwd}`, `shell: ${r.shell}`, `exit_code: ${r.timed_out ? 'TIMEOUT' : r.exit_code}`, `duration_ms: ${r.duration_ms}`, `finished_at: ${nowIso()}`,
     r.error ? `error: ${r.error}` : '', '', '----- stdout -----', r.stdout.slice(-200000), '----- stderr -----', r.stderr.slice(-200000)].join('\n');
   fs.writeFileSync(path.join(c.runDir, rel), body);
   const passed = r.exit_code === 0 && !r.timed_out && !r.error;
   return {
     cycle, kind: 'command', name: cmd, cmd, cwd, exit_code: r.exit_code, timed_out: r.timed_out, passed,
-    duration_ms: r.duration_ms, evidence: rel.replace(/\\/g, '/'), at: nowIso(),
+    duration_ms: r.duration_ms, evidence: rel.replace(/\\/g, '/'), evidence_sha256: sha256(body), operation: op, at: nowIso(),
     output_tail: passed ? '' : tail(`${r.stdout}\n${r.stderr}${r.error ? `\n${r.error}` : ''}`, 40, 2500),
   };
 }
@@ -902,7 +963,7 @@ function withCandidateCheckout(c, root, commit, use) {
   }
 }
 
-function runCandidateChecks(c, id, cycle, tag, commands, dir, timeout, candidate, setup) {
+function runCandidateChecks(c, id, cycle, op, tag, commands, dir, timeout, candidate, setup) {
   const actual = () => gitops.candidate(dir, 'HEAD');
   const intact = () => {
     const current = actual();
@@ -912,7 +973,7 @@ function runCandidateChecks(c, id, cycle, tag, commands, dir, timeout, candidate
   if (intact()) {
     const checks = [setup, ...commands].filter(Boolean);
     for (const [i, cmd] of checks.entries()) {
-      const result = { ...runAndRecord(c, id, cycle, `${tag}${i + 1}`, cmd, dir, timeout), candidate };
+      const result = { ...runAndRecord(c, id, cycle, op, `${tag}${i + 1}`, cmd, dir, timeout), candidate };
       results.push(result);
       if (!intact() || i === 0 && setup && !result.passed) break;
     }
@@ -942,7 +1003,11 @@ function snapshotId(snapshot) {
 
 function sharedBaseline(attempt) {
   try {
-    return requireCompleteSnapshot(JSON.parse(fs.readFileSync(attempt?.snapshot || '', 'utf8')));
+    const text = fs.readFileSync(attempt?.snapshot || '', 'utf8');
+    if (attempt.snapshot_sha256 && sha256(text) !== attempt.snapshot_sha256) {
+      throw new OrchError('INCOMPLETE_SCOPE', 'shared dispatch baseline does not match the digest recorded at dispatch; reconcile before retrying');
+    }
+    return requireCompleteSnapshot(JSON.parse(text));
   } catch (error) {
     if (error instanceof OrchError) throw error;
     throw new OrchError('INCOMPLETE_SCOPE', 'shared dispatch baseline is missing or unreadable; reconcile before retrying');
@@ -973,13 +1038,13 @@ function assessShared(root, baseline, scope, expected, cycle, stage) {
   return { checks, snapshot };
 }
 
-function runSharedChecks(c, id, cycle, tag, commands, root, timeout, setup, baseline, scope, expected) {
+function runSharedChecks(c, id, cycle, op, tag, commands, root, timeout, setup, baseline, scope, expected) {
   const initial = assessShared(root, baseline, scope, expected, cycle, 'before checks');
   const results = [...initial.checks];
   let snapshot = initial.snapshot;
   if (results.every((check) => check.passed)) {
     for (const [i, cmd] of [setup, ...commands].filter(Boolean).entries()) {
-      const result = runAndRecord(c, id, cycle, `${tag}${i + 1}`, cmd, root, timeout);
+      const result = runAndRecord(c, id, cycle, op, `${tag}${i + 1}`, cmd, root, timeout);
       results.push(result);
       const after = assessShared(root, baseline, scope, snapshot, cycle, `after command ${i + 1}`);
       results.push(...after.checks);
@@ -1006,32 +1071,41 @@ function cmdVerify(args) {
   const extra = extraCommands(args);
   const plan = c.store.transact((state) => {
     const t = sm.getTask(state, id);
-    if (t.state === 'REVIEWING' && args.flags.reverify) {
-      const reason = needFlag(args, 'reason');
-      if ((t.review_dispatches || []).some((dispatch) => dispatch.cycle === t.verify_cycle && ['active', 'unknown'].includes(reviewDispatchStatus(dispatch)))) {
-        throw new OrchError('REVIEW_IN_PROGRESS', 'reconcile outstanding reviewer identities before replacing their verification cycle');
+    // A fresh cycle has no earlier checks; its snapshot is compared only while its own commands run.
+    let fresh = false;
+    if (args.flags.reverify) {
+      // --reverify always opens a new cycle. Inside an open cycle it would keep that cycle's
+      // manual checks while skipping the comparison that proves they still describe the content.
+      if (!['REVIEWING', 'CORRECTION_REQUIRED'].includes(t.state)) {
+        throw new OrchError('REVERIFY_NOT_APPLICABLE', `${id} is ${t.state}; --reverify starts a new verification cycle only from REVIEWING or CORRECTION_REQUIRED. ${t.state === 'VERIFYING'
+          ? `Continue with \`fo verify ${id}\` (no --reverify): it compares the workspace with this cycle's pending evidence, and changed content moves the task to CORRECTION_REQUIRED, where --reverify opens a fresh cycle.`
+          : `Run \`fo verify ${id}\`.`}`);
       }
-      sm.transition(state, id, 'CORRECTION_REQUIRED', { reason: `verification invalidated: ${reason}` });
-    }
-    if (t.state === 'IMPLEMENTED') {
-      delete t.pending_verification_snapshot;
-      t.verify_cycle++;
-      sm.transition(state, id, 'VERIFYING', { reason: `verification cycle ${t.verify_cycle}` });
-    } else if (t.state === 'CORRECTION_REQUIRED' && args.flags.reverify) {
-      delete t.pending_verification_snapshot;
       const reason = needFlag(args, 'reason');
+      if (t.state === 'REVIEWING') {
+        if ((t.review_dispatches || []).some((dispatch) => dispatch.cycle === t.verify_cycle && ['active', 'unknown'].includes(reviewDispatchStatus(dispatch)))) {
+          throw new OrchError('REVIEW_IN_PROGRESS', 'reconcile outstanding reviewer identities before replacing their verification cycle');
+        }
+        sm.transition(state, id, 'CORRECTION_REQUIRED', { reason: `verification invalidated: ${reason}` });
+      }
+      delete t.pending_verification_snapshot;
       t.review_round++; // re-verifying without a new attempt still consumes a correction round
       t.verify_cycle++;
       sm.transition(state, id, 'VERIFYING', { reason: `re-verification: ${reason}` });
+      fresh = true;
+    } else if (t.state === 'IMPLEMENTED') {
+      delete t.pending_verification_snapshot;
+      t.verify_cycle++;
+      sm.transition(state, id, 'VERIFYING', { reason: `verification cycle ${t.verify_cycle}` });
     } else if (t.state === 'VERIFYING') {
       t.checks = t.checks.filter((x) => x.cycle !== t.verify_cycle || x.kind === 'manual');
     } else {
-      throw new OrchError('WRONG_STATE', `${id} is ${t.state}; verification starts from IMPLEMENTED`);
+      throw new OrchError('WRONG_STATE', `${id} is ${t.state}; verification starts from IMPLEMENTED${t.state === 'CORRECTION_REQUIRED' || t.state === 'REVIEWING' ? ' (or re-verify with --reverify --reason "...", which consumes a correction round)' : ''}`);
     }
     const a = sm.lastAttempt(t);
     if (t.verification_operation) throw new OrchError('VERIFICATION_IN_PROGRESS', `${id}: a previous verifier may still be active`);
     const baseline = state.project.git ? null : sharedBaseline(a);
-    t.verification_operation = { id: crypto.randomUUID(), pid: process.pid };
+    t.verification_operation = { id: crypto.randomUUID(), pid: process.pid, host: os.hostname() };
     const candidate = state.project.git ? gitops.candidate(state.project.root, a.commit || a.base) : null;
     delete t.verified_snapshot;
     delete t.verified_snapshot_id;
@@ -1040,14 +1114,14 @@ function cmdVerify(args) {
       cmds: t.contract.verification_commands.concat(extra), cwd: state.project.root, cycle: t.verify_cycle,
       setup: state.config.integration.setup_command, operation: t.verification_operation.id, candidate,
       base: a.base, baseline, scope: t.contract.file_scope,
-      expected: baseline && !args.flags.reverify ? requireCompleteSnapshot(t.pending_verification_snapshot || a.report_snapshot) : null,
+      expected: baseline && !fresh ? requireCompleteSnapshot(t.pending_verification_snapshot || a.report_snapshot) : null,
       timeout: state.config.verification.command_timeout_seconds * 1000,
     };
   });
 
   const trial = plan.candidate
-    ? { results: withCandidateCheckout(c, plan.cwd, plan.candidate.commit, (dir) => runCandidateChecks(c, id, plan.cycle, 'v', plan.cmds, dir, plan.timeout, plan.candidate, plan.setup)) }
-    : runSharedChecks(c, id, plan.cycle, 'v', plan.cmds, plan.cwd, plan.timeout, plan.setup, plan.baseline, plan.scope, plan.expected);
+    ? { results: withCandidateCheckout(c, plan.cwd, plan.candidate.commit, (dir) => runCandidateChecks(c, id, plan.cycle, plan.operation, 'v', plan.cmds, dir, plan.timeout, plan.candidate, plan.setup)) }
+    : runSharedChecks(c, id, plan.cycle, plan.operation, 'v', plan.cmds, plan.cwd, plan.timeout, plan.setup, plan.baseline, plan.scope, plan.expected);
   const results = trial.results;
 
   const out = c.store.transact((state) => {
@@ -1061,6 +1135,14 @@ function cmdVerify(args) {
       const final = assessShared(plan.cwd, plan.baseline, plan.scope, trial.snapshot, plan.cycle, 'before recording verification');
       results.push(...final.checks);
       trial.snapshot = final.snapshot;
+    }
+    // A manual check vouches only for the content it was recorded against.
+    const bound = plan.candidate ? plan.candidate.commit : trial.snapshot ? snapshotId(trial.snapshot) : null;
+    const stale = t.checks.filter((x) => x.cycle === plan.cycle && x.kind === 'manual' &&
+      (!bound || (plan.candidate ? x.candidate?.commit : x.snapshot_id) !== bound));
+    if (stale.length) {
+      results.push({ cycle: plan.cycle, kind: 'candidate', name: 'manual check freshness', passed: false, at: nowIso(),
+        detail: `manual check(s) not recorded against the verified content: ${stale.map((x) => clip(x.name, 60)).join(', ')}; re-verify and record them again` });
     }
     t.checks.push(...results);
     if (plan.candidate && a && a.isolation !== 'none' && a.changed_files) {
@@ -1129,7 +1211,12 @@ function cmdCheck(args) {
     } else if (t.state !== 'VERIFYING') {
       throw new OrchError('WRONG_STATE', `${id} is ${t.state}; manual checks are recorded during verification`);
     }
-    t.checks.push({ cycle: t.verify_cycle, kind: 'manual', name, passed: result === 'pass', detail: note, at: nowIso() });
+    // Bind the check to what was inspected; verification refuses it for any other content.
+    const a = sm.lastAttempt(t);
+    const binding = state.project.git
+      ? { candidate: gitops.candidate(state.project.root, a.commit || a.base) }
+      : { snapshot_id: snapshotId(sharedSnapshot(state.project.root)) };
+    t.checks.push({ cycle: t.verify_cycle, kind: 'manual', name, passed: result === 'pass', detail: note, at: nowIso(), ...binding });
   });
   console.log(`${id}: manual check recorded (${result}): ${name}. Run \`fo verify ${id}\` to finish verification.`);
 }
@@ -1204,12 +1291,15 @@ function cmdReviewPackage(args) {
     k.acceptance_criteria.forEach((x, i) => L.push(`${i + 1}. ${x}`));
     L.push(`Authorized file scope: ${k.file_scope.join(', ') || '(read-only task)'}`);
     L.push('', '## The change');
+    let diffCopy = null;
     if (candidate.commit) {
       const diff = gitops.git(where, ['diff', '--no-ext-diff', '--no-textconv', '--no-color', `${a.base}...${candidate.commit}`, '--']);
       if (diff.code !== 0) throw new OrchError('DIFF_UNAVAILABLE', 'could not generate the candidate review diff');
-      const evidence = path.join(c.runDir, 'evidence', `${id}-review-${dispatch.id}.diff`);
-      sm.writeAtomic(evidence, diff.raw);
-      L.push(`Read the diff at ${evidence} (generated by git diff ${a.base}...${candidate.commit}).`,
+      // Written only after this dispatch commits; the digest in state identifies the accepted file.
+      diffCopy = recordFile(path.join('evidence', `${id}-review-${dispatch.id}.diff`), diff.raw);
+      dispatch.diff = { file: diffCopy.file, sha256: diffCopy.sha256 };
+      const evidence = path.join(c.runDir, diffCopy.file);
+      L.push(`Read the diff at ${evidence} (generated by git diff ${a.base}...${candidate.commit}; SHA-256 ${diffCopy.sha256}).`,
         `Verified commit: ${candidate.commit}`, `Verified tree: ${candidate.tree}`, `Base commit: ${a.base}`,
         `Ask the orchestrator to supply exact surrounding file content using git show ${candidate.commit}:<path> in repository ${where}. Your read-only tools cannot execute that command. Do not substitute working-tree files.`,
         `Changed files: ${(a.changed_files || []).join(', ') || '(none)'}`);
@@ -1234,8 +1324,29 @@ function cmdReviewPackage(args) {
     L.push('findings: []                # when rejecting: each defect, where it is, and why it matters', '```');
     state.budget.agent_calls++;
     sm.emit(state, { type: 'review_dispatched', task: id, dispatch: dispatch.id, attempt: dispatch.attempt, candidate: dispatch.candidate, perspective });
-    return { text: L.join('\n'), model: t.route.tier.startsWith('lead') ? 'opus' : 'sonnet' };
+    return { text: L.join('\n'), model: t.route.tier.startsWith('lead') ? 'opus' : 'sonnet', dispatch: dispatch.id, diffCopy };
   });
+  if (out.diffCopy) {
+    try {
+      sm.writeAtomic(path.join(c.runDir, out.diffCopy.file), out.diffCopy.text);
+    } catch (e) {
+      // The prompt was never printed, so no reviewer can hold this dispatch: retire it and return its call.
+      let retired = false;
+      try {
+        c.store.transact((state) => {
+          const d = (state.tasks[id].review_dispatches || []).find((x) => x.id === out.dispatch);
+          if (!d || d.agent_id || reviewDispatchStatus(d) !== 'unknown') return;
+          setReviewDispatchStatus(d, 'failed', 'review diff could not be written; the prompt was never issued');
+          state.budget.agent_calls = Math.max(0, state.budget.agent_calls - 1);
+          sm.emit(state, { type: 'review_dispatch_unissued', task: id, dispatch: d.id });
+          retired = true;
+        });
+      } catch (e2) { /* the instructions below cover the unretired dispatch */ }
+      throw new OrchError('EVIDENCE_WRITE_FAILED', `${id}: the review diff could not be written (${e.message}); no prompt was issued. ${retired
+        ? `Dispatch ${out.dispatch} is recorded as failed and its agent call returned. Run fo review-package ${id} again.`
+        : `Retire dispatch ${out.dispatch} with fo reconcile ${id} --review-dispatch-id ${out.dispatch} --liveness failed --reason "prompt never issued", then run fo review-package ${id} again.`}`, 1);
+    }
+  }
   console.log(`REVIEW DISPATCH for ${id}\nAgent call: subagent_type=fable-orchestrator-review-worker | model=${out.model} | description="Review ${id}"\n  If this restricted agent is unavailable, install it before dispatch.\n--- prompt: pass verbatim ---\n${out.text}\n--- end prompt ---\nThen pass the review YAML with the distinct host completion ID: fo review ${id} --agent-id <host ID> --stdin`);
 }
 
@@ -1283,12 +1394,14 @@ function cmdReview(args) {
     r.candidate_tree = identity.tree;
     if (identity.snapshot_id) r.candidate_snapshot = identity.snapshot_id;
     t.reviews.push(r);
-    sm.writeAtomic(path.join(c.runDir, 'reviews', `${id}-c${t.verify_cycle}-${sm.currentReviews(t).length}.yaml`), yaml.dump(r));
+    const copy = recordFile(path.join('reviews', `${id}-c${t.verify_cycle}-${sm.currentReviews(t).length}.yaml`), yaml.dump(r));
+    r.record = { file: copy.file, sha256: copy.sha256 };
     const gate = sm.reviewGate(t);
     if (gate.rejected) sm.transition(state, id, 'CORRECTION_REQUIRED', { reason: `review rejected by ${r.reviewer}: ${clip(r.findings[0] || 'acceptance criteria not met', 160)}` });
     else if (gate.satisfied) sm.transition(state, id, 'APPROVED', { reason: 'verification passed and reviews approved' });
-    return { state: t.state, missing: gate.missing, left: sm.maxRounds(state, t) - t.review_round };
+    return { state: t.state, missing: gate.missing, left: sm.maxRounds(state, t) - t.review_round, copy };
   });
+  writeRecords(c, [out.copy]);
   if (out.state === 'APPROVED') {
     console.log(`${id}: APPROVED`);
     if (args.flags.integrate) cmdIntegrate({ _: [id], flags: chained(args), rest: null });
@@ -1359,12 +1472,13 @@ function cmdCorrect(args) {
     if (k.strategy_change && (k.strategy_change.kind === 'model' || k.assign_role)) applyStrategy(state, c, t, { kind: k.strategy_change.kind, detail: k.strategy_change.detail, model: k.strategy_change.model, role: k.assign_role || null });
     else if (k.assign_role) applyStrategy(state, c, t, { kind: 'strategy', detail: `reassigned to ${k.assign_role}`, role: k.assign_role });
     else if (k.strategy_change) t.escalations.push({ at: nowIso(), kind: k.strategy_change.kind, detail: k.strategy_change.detail, from: { tier: t.route.tier, model: t.route.model, role: t.route.role }, to: { tier: t.route.tier, model: t.route.model, role: t.route.role } });
-    t.corrections.push(Object.assign({ round, cycle: t.verify_cycle, at: nowIso() }, k));
-    fs.writeFileSync(path.join(c.runDir, 'corrections', `${id}-r${round}.yaml`), yaml.dump(k));
+    const copy = recordFile(path.join('corrections', `${id}-r${round}.yaml`), yaml.dump(k));
+    t.corrections.push(Object.assign({ round, cycle: t.verify_cycle, at: nowIso() }, k, { record: { file: copy.file, sha256: copy.sha256 } }));
     t.review_round = round;
     sm.transition(state, id, 'READY', { reason: `correction round ${round}: ${clip(k.failure, 160)}` });
-    return { round, max, route: t.route };
+    return { round, max, route: t.route, copy };
   });
+  writeRecords(c, [out.copy]);
   observe(c, { category: 'correction', task: id, text: `round ${out.round}: ${clip(raw.failure || '', 200)}` });
   console.log(`${id}: correction round ${out.round} of ${out.max} recorded -> READY (${out.route.role} on ${out.route.model}). NEXT: fo next`);
 }
@@ -1383,7 +1497,7 @@ function cmdIntegrate(args) {
     }
     ensureIntegration(state, c);
     sm.transition(state, id, 'INTEGRATING', { reason: 'integration started' });
-    t.integration_operation = { id: crypto.randomUUID(), pid: process.pid };
+    t.integration_operation = { id: crypto.randomUUID(), pid: process.pid, host: os.hostname() };
     const a = sm.lastAttempt(t);
     const g = state.project.git;
     if (g && (!t.verified_candidate || t.verified_candidate.commit !== (a.commit || a.base))) {
@@ -1422,10 +1536,10 @@ function cmdIntegrate(args) {
         if (!merge.noop) gitops.mergeCommit(dir, `Integrate ${id}: ${plan.title}\n\nFable-Run: ${c.runId}\nFable-Task: ${id}`);
       }
       const candidate = gitops.candidate(dir, 'HEAD');
-      const results = runCandidateChecks(c, id, plan.cycle, 'i', plan.cmds, dir, plan.timeout, candidate, plan.setup);
+      const results = runCandidateChecks(c, id, plan.cycle, plan.operation, 'i', plan.cmds, dir, plan.timeout, candidate, plan.setup);
       return { candidate, results, already };
     })
-    : runSharedChecks(c, id, plan.cycle, 'i', plan.cmds, plan.dir, plan.timeout, plan.setup, plan.baseline, plan.scope, plan.expected);
+    : runSharedChecks(c, id, plan.cycle, plan.operation, 'i', plan.cmds, plan.dir, plan.timeout, plan.setup, plan.baseline, plan.scope, plan.expected);
   const { candidate, conflict, results, already } = trial;
   const failed = results.filter((r) => !r.passed);
   let mergeSha = null;
@@ -1493,7 +1607,7 @@ function cmdDeliver(args) {
     if (state.delivery_operation || Object.values(state.tasks).some((t) => t.state === 'INTEGRATING')) {
       throw new OrchError('INTEGRATION_BUSY', 'another integration or delivery may still be active');
     }
-    state.delivery_operation = { id: crypto.randomUUID(), pid: process.pid };
+    state.delivery_operation = { id: crypto.randomUUID(), pid: process.pid, host: os.hostname() };
     return state;
   });
   const g = pre.project.git;
@@ -1508,14 +1622,14 @@ function cmdDeliver(args) {
     });
     if (reg) commands.push(reg);
     const setup = pre.config.integration.setup_command;
-    audit = withCandidateCheckout(c, pre.project.root, target.commit, (dir) => runCandidateChecks(c, 'RUN', 0, 'final-audit-', [...new Set(commands)], dir, pre.config.verification.command_timeout_seconds * 1000, target, setup));
+    audit = withCandidateCheckout(c, pre.project.root, target.commit, (dir) => runCandidateChecks(c, 'RUN', 0, pre.delivery_operation.id, 'final-audit-', [...new Set(commands)], dir, pre.config.verification.command_timeout_seconds * 1000, target, setup));
   }
   if (!g && pre.order.length && pre.order.every((id) => sm.TERMINAL.includes(pre.tasks[id].state))) {
     const baseline = pre.project.shared_integration?.snapshot;
     const commands = pre.order.flatMap((id) => pre.tasks[id].state === 'COMPLETED' ? pre.tasks[id].integration?.commands || pre.tasks[id].contract.verification_commands : []);
     if (reg) commands.push(reg);
     const scope = pre.order.flatMap((id) => pre.tasks[id].contract.file_scope);
-    sharedAudit = runSharedChecks(c, 'RUN', 0, 'final-audit-', [...new Set(commands)], pre.project.root,
+    sharedAudit = runSharedChecks(c, 'RUN', 0, pre.delivery_operation.id, 'final-audit-', [...new Set(commands)], pre.project.root,
       pre.config.verification.command_timeout_seconds * 1000, pre.config.integration.setup_command, baseline, scope, baseline);
     audit = sharedAudit.results;
   }
@@ -1877,6 +1991,10 @@ function cmdReconcile(args) {
   const reason = needFlag(args, 'reason');
   const confirmStopped = (operation) => {
     if (!operation?.pid) return;
+    // A process ID means nothing on another machine sharing this run directory.
+    if (operation.host && operation.host !== os.hostname()) {
+      throw new OrchError('OPERATION_ACTIVE', `the operation was started on host ${operation.host}; confirm it stopped there and reconcile from that host`);
+    }
     try { process.kill(operation.pid, 0); } catch (e) { if (e.code === 'ESRCH') return; }
     throw new OrchError('OPERATION_ACTIVE', `process ${operation.pid} may still own this operation`);
   };
@@ -2091,6 +2209,7 @@ function cmdHelp() {
     '  worker-failed ID --attempt-id UUID --kind K --reason R   record a confirmed failure',
     '  check ID --name N --result pass|fail --note T   record a manual verification check',
     '  verify ID [--cmd C]            run verification commands, check file scope, decide REVIEWING or CORRECTION_REQUIRED',
+    '  verify ID --reverify --reason R    from REVIEWING or CORRECTION_REQUIRED: new cycle without earlier checks (uses a correction round)',
     '  review-package ID              prompt for an independent review-worker',
     '  review ID --stdin [--integrate]    record a review; approve only with evidence for every criterion',
     '  correct ID --stdin             record a targeted correction and re-queue the task (bounded rounds)',

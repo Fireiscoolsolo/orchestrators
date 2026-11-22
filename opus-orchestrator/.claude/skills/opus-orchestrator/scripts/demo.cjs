@@ -219,6 +219,7 @@ function simulatedWorker(d, id, o) {
   }
   const report = {
     task_id: id,
+    attempt_id: t.dispatch.attempt_id, // copied from the package's report template, as a real worker does
     status: 'completed',
     summary: o.summary,
     files_changed: Object.keys(o.files),
@@ -284,22 +285,32 @@ function workPlan(d, id, phase) {
 }
 
 /**
- * A scripted reviewer. It re-runs the task's own verification commands in the workspace the
- * verification used and approves only when every one exits 0, so the verdict is computed, not
- * fixed. The report has one criteria entry per acceptance criterion, as DESIGN 3.5 requires.
+ * A scripted reviewer. Like the real read-only reviewer it runs nothing: it reads the
+ * orchestrator's verification evidence (every command and its exit code) and, for an independent
+ * review, the pinned evidence file of its package, and approves only when every command exited 0
+ * and the pinned evidence covers every changed file, so the verdict is computed, not fixed. The
+ * report has one criteria entry per acceptance criterion, as DESIGN 3.5 requires.
  */
 function simulatedReview(d, id, reviewer) {
   const t = d.task(id);
   const v = t.evidence.verification;
-  const cwd = path.resolve(d.dirs.dir, String(v.workspace));
-  const results = (t.verification_commands || []).map((c) => ({ command: c, code: shell(c, cwd).code }));
-  const ok = results.every((r) => r.code === 0);
+  const results = (v.commands || []).map((c) => ({ command: c.command, code: c.exit_code }));
+  let ok = v.passed === true && results.every((r) => r.code === 0);
+  let reviewId = null;
+  if (reviewer !== 'orchestrator') {
+    const issued = (t.review_dispatches || []).filter((x) => x.status === 'issued').pop();
+    check(issued, `${id}: no issued review package`);
+    reviewId = issued.review_id;
+    const pinned = read(path.join(d.dirs.dir, ...issued.evidence.split('/')));
+    ok = ok && (v.changed_files || []).every((f) => pinned.includes(f));
+  }
   const what = results.length ? results.map((r) => `\`${r.command}\` exit ${r.code}`).join('; ') : 'no commands';
   const rep = {
     task_id: id,
+    review_id: reviewId,
     reviewer,
     verdict: ok ? 'approve' : 'request_changes',
-    criteria: t.acceptance_criteria.map((c, i) => ({ met: ok, evidence: `SIMULATED reviewer (scripted code) re-ran ${what}; criterion ${i + 1}` })),
+    criteria: t.acceptance_criteria.map((c, i) => ({ met: ok, evidence: `SIMULATED reviewer (scripted code) read the recorded results ${what}; criterion ${i + 1}` })),
     findings: ok ? [] : [{ severity: 'major', file: (t.authorized_files || ['?'])[0], description: 'a verification command failed in the review re-run' }],
   };
   return fence(rep, `SIMULATED ${reviewer === 'orchestrator' ? 'orchestrator quality gate' : 'independent reviewer'} message for ${id} (scripted code, no model).`);
@@ -316,7 +327,8 @@ function reviewTask(d, id, integrate) {
   if (t.routing.independent_review) {
     const pkg = d.oo(['review-package', id]);
     check(/REVIEW PACKAGE/.test(pkg), `oo review-package ${id} printed no review package`);
-    const r = d.oo(['review', id, '--stdin'], { input: simulatedReview(d, id, 'opus-reviewer'), label: `review ${id} --stdin (independent reviewer, simulated)` });
+    // --agent-id: the identity the host returns for the launched reviewer (simulated here)
+    const r = d.oo(['review', id, '--stdin', '--agent-id', `demo-reviewer-${id.toLowerCase()}`], { input: simulatedReview(d, id, 'opus-reviewer'), label: `review ${id} --stdin --agent-id demo-reviewer-${id.toLowerCase()} (independent reviewer, simulated)` });
     check(/INDEPENDENT REVIEW RECORDED/.test(r), `the independent review of ${id} was not recorded:\n${r}`);
   }
   const args = ['review', id, '--stdin'];
@@ -354,27 +366,52 @@ function scenario(d) {
   check(/wave 1: (SLUG-001, WORD-001|WORD-001, SLUG-001)/.test(planText), `the plan does not start with the two independent tasks:\n${planText}`);
   d.end();
 
-  // 3. concurrent dispatch of the two independent tasks, then their first results
-  d.begin('concurrent dispatch of SLUG-001 and WORD-001');
-  const nextText = dispatch(d, ['SLUG-001', 'WORD-001'], ['SUM-001', 'DOC-001']);
-  check(/issue the 2 Agent call\(s\) below in ONE message/.test(nextText), `oo next did not dispatch both tasks as one parallel batch:\n${nextText}`);
-  d.oo(['started', 'SLUG-001', 'WORD-001']);
-  check(d.task('SLUG-001').status === 'RUNNING' && d.task('WORD-001').status === 'RUNNING', 'both tasks should be RUNNING');
-  // both scripted workers are running at the same time: both workspaces exist before either reports
-  const slug1 = simulatedWorker(d, 'SLUG-001', Object.assign({}, workPlan(d, 'SLUG-001', 'first')));
-  const word1 = simulatedWorker(d, 'WORD-001', Object.assign({}, workPlan(d, 'WORD-001', 'first')));
-  check(!d.useGit || slug1.dir !== word1.dir, 'the two workers share a workspace');
-  d.oo(slug1.args, { input: slug1.input, label: 'result SLUG-001 --stdin (simulated worker report)' });
-  d.oo(word1.args, { input: word1.input, label: 'result WORD-001 --stdin (simulated worker report)' });
-  d.end();
+  if (d.useGit) {
+    // 3. concurrent dispatch of the two independent tasks (isolated worktrees), then their first results
+    d.begin('concurrent dispatch of SLUG-001 and WORD-001');
+    const nextText = dispatch(d, ['SLUG-001', 'WORD-001'], ['SUM-001', 'DOC-001']);
+    check(/issue the 2 Agent call\(s\) below in ONE message/.test(nextText), `oo next did not dispatch both tasks as one parallel batch:\n${nextText}`);
+    d.oo(['started', 'SLUG-001', 'WORD-001']);
+    check(d.task('SLUG-001').status === 'RUNNING' && d.task('WORD-001').status === 'RUNNING', 'both tasks should be RUNNING');
+    // both scripted workers are running at the same time: both workspaces exist before either reports
+    const slug1 = simulatedWorker(d, 'SLUG-001', Object.assign({}, workPlan(d, 'SLUG-001', 'first')));
+    const word1 = simulatedWorker(d, 'WORD-001', Object.assign({}, workPlan(d, 'WORD-001', 'first')));
+    check(slug1.dir !== word1.dir, 'the two workers share a workspace');
+    d.oo(slug1.args, { input: slug1.input, label: 'result SLUG-001 --stdin (simulated worker report)' });
+    d.oo(word1.args, { input: word1.input, label: 'result WORD-001 --stdin (simulated worker report)' });
+    d.end();
 
-  // 4. verification (oo runs the commands itself; the first slugify must fail the acceptance test)
-  d.begin('verification');
-  const w = d.oo(['verify', 'WORD-001']);
-  check(/VERIFICATION PASSED: WORD-001/.test(w), `WORD-001 verification did not pass:\n${w}`);
-  const s = d.oo(['verify', 'SLUG-001'], { expect: 1 });
-  check(/VERIFICATION FAILED: SLUG-001 -> CORRECTION_REQUIRED/.test(s), `SLUG-001 verification did not fail as the scenario requires:\n${s}`);
-  d.end();
+    // 4. verification (oo runs the commands itself; the first slugify must fail the acceptance test)
+    d.begin('verification');
+    const w = d.oo(['verify', 'WORD-001']);
+    check(/VERIFICATION PASSED: WORD-001/.test(w), `WORD-001 verification did not pass:\n${w}`);
+    const s = d.oo(['verify', 'SLUG-001'], { expect: 1 });
+    check(/VERIFICATION FAILED: SLUG-001 -> CORRECTION_REQUIRED/.test(s), `SLUG-001 verification did not fail as the scenario requires:\n${s}`);
+    d.end();
+  } else {
+    // 3. shared workspace: writers in one directory run one at a time, because concurrent changes
+    // there could not be attributed; the second independent task waits for the first's verification
+    d.begin('dispatch of SLUG-001 (shared workspace: one writer at a time)');
+    const nextText = dispatch(d, ['SLUG-001'], ['WORD-001', 'SUM-001', 'DOC-001']);
+    check(/WORD-001: shared_serial/.test(nextText), `oo next did not defer WORD-001 in the shared workspace:\n${nextText}`);
+    d.oo(['started', 'SLUG-001']);
+    const slug1 = simulatedWorker(d, 'SLUG-001', Object.assign({}, workPlan(d, 'SLUG-001', 'first')));
+    d.oo(slug1.args, { input: slug1.input, label: 'result SLUG-001 --stdin (simulated worker report)' });
+    d.end();
+
+    // 4. verification (oo runs the commands itself; the first slugify must fail the acceptance test),
+    // after which WORD-001 is dispatched and verified
+    d.begin('verification');
+    const s = d.oo(['verify', 'SLUG-001'], { expect: 1 });
+    check(/VERIFICATION FAILED: SLUG-001 -> CORRECTION_REQUIRED/.test(s), `SLUG-001 verification did not fail as the scenario requires:\n${s}`);
+    dispatch(d, ['WORD-001'], ['SLUG-001', 'SUM-001', 'DOC-001']);
+    d.oo(['started', 'WORD-001']);
+    const word1 = simulatedWorker(d, 'WORD-001', Object.assign({}, workPlan(d, 'WORD-001', 'first')));
+    d.oo(word1.args, { input: word1.input, label: 'result WORD-001 --stdin (simulated worker report)' });
+    const w = d.oo(['verify', 'WORD-001']);
+    check(/VERIFICATION PASSED: WORD-001/.test(w), `WORD-001 verification did not pass:\n${w}`);
+    d.end();
+  }
 
   // 5. detection of the failing acceptance test, from the persisted evidence
   d.begin('detection of the failing acceptance test');

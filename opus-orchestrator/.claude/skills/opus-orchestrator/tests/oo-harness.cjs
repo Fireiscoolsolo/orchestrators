@@ -19,6 +19,8 @@ const store = require('../scripts/lib/store.cjs');
 const SKILL = path.resolve(__dirname, '..');
 const OO = path.join(SKILL, 'scripts', 'oo.cjs');
 const roots = [];
+const CURRENT_ATTEMPT = '__CURRENT_ATTEMPT__';
+const CURRENT_REVIEW = '__CURRENT_REVIEW__';
 
 function removeDir(dir) {
   try {
@@ -73,14 +75,35 @@ function project(opts = {}) {
     fs.writeFileSync(path.join(dir, '.claude', 'opus-orchestrator', 'config.yaml'), opts.config);
   }
   const ooFile = opts.skill ? path.join(opts.skill, 'scripts', 'oo.cjs') : OO;
-  const env = baseEnv({ OPUS_ORCH_PROJECT_DIR: dir, OPUS_ORCH_HOME: home });
+  const env = baseEnv(Object.assign({ OPUS_ORCH_PROJECT_DIR: dir, OPUS_ORCH_HOME: home }, opts.env || {}));
   const paths = store.resolvePaths({ projectDir: dir });
 
   const p = {
     root, dir, home, env, paths,
     run(args, o = {}) {
-      const r = spawnSync(process.execPath, [ooFile, ...args], {
-        cwd: o.cwd || dir, env, input: o.input === undefined ? '' : o.input, encoding: 'utf8', timeout: 120000, windowsHide: true,
+      let input = o.input === undefined ? '' : o.input;
+      let argv = args;
+      // A simulated worker copies the attempt id of its package, and a simulated reviewer the
+      // review id of its package, exactly as a real agent copies them from the report template.
+      // The harness reads them from oo's state; tests of stale or foreign ids pass them explicitly.
+      if (typeof input === 'string' && input.includes(CURRENT_ATTEMPT)) {
+        let cur = 'none';
+        try { cur = (p.task(args[1]).dispatch || {}).attempt_id || 'none'; } catch (_) { /* no such task: oo refuses */ }
+        input = input.split(CURRENT_ATTEMPT).join(cur);
+      }
+      if (typeof input === 'string' && input.includes(CURRENT_REVIEW)) {
+        let rid = 'none';
+        let n = 0;
+        try {
+          const ds = (p.task(args[1]).review_dispatches || []).filter((d) => d.status === 'issued');
+          if (ds.length) { rid = ds[ds.length - 1].review_id; n = ds[ds.length - 1].n; }
+        } catch (_) { /* no such task */ }
+        input = input.split(CURRENT_REVIEW).join(rid);
+        // Simulated host identity of the reviewer agent (one per review package).
+        if (!argv.includes('--agent-id')) argv = argv.concat(['--agent-id', `sim-reviewer-${n}`]);
+      }
+      const r = spawnSync(process.execPath, [ooFile, ...argv], {
+        cwd: o.cwd || dir, env, input, encoding: 'utf8', timeout: 120000, windowsHide: true,
       });
       return { code: r.status, out: (r.stdout || '') + (r.stderr || ''), stdout: r.stdout || '' };
     },
@@ -147,6 +170,7 @@ function report(id, o = {}) {
   const n = o.criteria === undefined ? 1 : o.criteria;
   const r = {
     task_id: id,
+    attempt_id: o.attempt === undefined ? CURRENT_ATTEMPT : o.attempt,
     status: o.status || 'completed',
     summary: o.summary || `simulated worker finished ${id}`,
     files_changed: o.files || [],
@@ -167,6 +191,7 @@ function review(id, o = {}) {
   const verdict = o.verdict || 'approve';
   const r = {
     task_id: id,
+    review_id: o.reviewId === undefined ? ((o.reviewer || 'orchestrator') === 'orchestrator' ? null : CURRENT_REVIEW) : o.reviewId,
     reviewer: o.reviewer || 'orchestrator',
     verdict,
     criteria: Array.from({ length: n }, (_, i) => ({ met: verdict === 'approve', evidence: `simulated review of criterion ${i + 1}` })),

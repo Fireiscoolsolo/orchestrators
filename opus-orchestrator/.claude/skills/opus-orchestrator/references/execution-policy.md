@@ -86,12 +86,11 @@ Worker report: a fenced `yaml` block (or text starting with `task_id:`) with `st
 
 Used without git, without a commit, or with `execution.isolation` set to anything but `auto` or `worktree`. Workers edit the project in place.
 
-- `oo next` takes a snapshot of every file (size and modification time) and records it with the dispatch, ignoring `.git`, `node_modules`, `.claude/worktrees`, the state directory and the inbox.
-- At verification, `oo` snapshots again and diffs. A changed file inside the task's `authorized_files` is its change. A changed file outside them but inside the scope of another task that owned work at any time since the dispatch is attributed to that task and ignored. Any other changed file is a scope violation and fails the verification.
-- Tasks with overlapping scopes never run at the same time (section 2), which is what makes the attribution possible.
-- Integration re-runs the task's verification commands (and the regression command when it applies) in the project directory. `oo deliver` has nothing to move.
-
-The snapshot comparison is coarse by design: see the limitations in the README.
+- At a task's first dispatch `oo next` takes a content-hash snapshot (SHA-256 of every file; links recorded, never followed) as the task's baseline, kept across retries and correction rounds. It ignores `node_modules`, `.claude/worktrees`, the state directory and the inbox, and of `.git` records only `config` and `hooks/`. A file it cannot read makes the snapshot incomplete, and nothing is dispatched.
+- At verification `oo` snapshots again and compares. A changed file inside the task's `authorized_files` is its change. A changed file outside them is a scope violation, unless its current content is exactly what another task's verified candidate recorded for that path; a path matching `verification.generated_artifacts` is listed but is not scope evidence. Another task's scope never excuses a change. Violations are left in place: `oo` refuses the evidence and never reverts anything.
+- Concurrent changes in one directory cannot be attributed, so writing tasks run one at a time: a task enters its evidence window (DISPATCHED to VERIFYING, and INTEGRATING) only when no other task's window is open, unless neither writes (deferral reason `shared_serial`). Use a git repository for parallel work.
+- Integration re-checks that every verified file still has its verified content (a change sends the task to correction), refuses while another task's window is open, re-runs the task's verification commands (and the regression command when it applies) in the project directory, and refuses results when those commands changed sources. `oo deliver` checks that every integrated file still has its integrated content and has nothing to move.
+- `oo rebaseline <ID> --reason T --user-authorized` discards a lost baseline so that the next dispatch takes a new one; only the user decides that.
 
 ## 4. Verification, review and integration order
 
@@ -99,4 +98,4 @@ For a task: `result` (IMPLEMENTED) -> `verify` (VERIFYING, then REVIEWING or COR
 
 ## 5. Interrupted work
 
-`oo resume --requeue-running` returns DISPATCHED and RUNNING tasks to READY without spending a retry, except tasks with external side effects, which it lists as not requeued. Details in `recovery-policy.md`.
+In-flight work is never requeued on a guess: `oo resume` lists each attempt, and `oo reconcile <ID> --attempt <AID> --agent-gone --reason T` returns one attempt whose agent is known to have stopped to READY without spending a retry (never a task with external side effects). Details in `recovery-policy.md`.

@@ -146,7 +146,7 @@ test('duplicate keys, multi-line flow, unterminated quotes, stray content throw'
 });
 
 test('unknown escapes in double-quoted strings keep a literal backslash', () => {
-  assert.deepEqual(parse('a: "C:\\Users\\ExampleUser\\src\\x.js"\n'), { a: 'C:\\Users\\ExampleUser\\src\\x.js' });
+  assert.deepEqual(parse('a: "C:\\Users\\dev\\src\\x.js"\n'), { a: 'C:\\Users\\dev\\src\\x.js' });
   assert.deepEqual(parse('a: "^\\S+\\d{3}$ \\q"\n'), { a: '^\\S+\\d{3}$ \\q' });
   // an invalid \u or \x (Windows "\users", "\xampp") is also literal
   assert.deepEqual(parse('a: "C:\\users\\xampp"\n'), { a: 'C:\\users\\xampp' });

@@ -187,13 +187,18 @@ test('withLock: exclusive, returns value, releases on throw', () => {
   } finally { done(); }
 });
 
-test('withLock takes over old lock and dead-pid lock', () => {
+test('withLock keeps an old lock of a live owner and takes over the lock of a dead owner', () => {
   const { paths, done } = setup();
   try {
     const lock = path.join(paths.stateRoot, '.lock');
-    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, ts: Date.now() - 31000 }));
-    assert.equal(store.withLock(paths, () => 'old'), 'old');
-    fs.writeFileSync(lock, JSON.stringify({ pid: 2147483646, ts: Date.now() }));
+    const live = { token: '00000000-0000-4000-8000-000000000001', pid: process.pid, host: os.hostname(), acquired_at: new Date(Date.now() - 31000).toISOString() };
+    fs.writeFileSync(lock, JSON.stringify(live));
+    throwsCode(() => store.withLock(paths, () => 'old', { waitMs: 200 }), 'LOCK_TIMEOUT');
+    assert.deepEqual(JSON.parse(fs.readFileSync(lock, 'utf8')), live, 'age alone never frees a lock');
+    // a process id above every platform's pid range (a just-exited child's id may be reused under load)
+    let gone = 2147470000;
+    for (;; gone++) { try { process.kill(gone, 0); } catch (e) { if (e.code === 'ESRCH') break; } }
+    fs.writeFileSync(lock, JSON.stringify(Object.assign({}, live, { token: '00000000-0000-4000-8000-000000000002', pid: gone })));
     assert.equal(store.withLock(paths, () => 'dead'), 'dead');
     assert.ok(!fs.existsSync(lock));
   } finally { done(); }
@@ -203,10 +208,10 @@ test('withLock waits for a live lock then fails with LOCK_TIMEOUT', { timeout: 2
   const { paths, done } = setup();
   try {
     const lock = path.join(paths.stateRoot, '.lock');
-    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, ts: Date.now() }));
+    fs.writeFileSync(lock, JSON.stringify({ token: '00000000-0000-4000-8000-000000000003', pid: process.pid, host: os.hostname(), acquired_at: new Date().toISOString() }));
     const t0 = Date.now();
-    throwsCode(() => store.withLock(paths, () => 1), 'LOCK_TIMEOUT');
-    assert.ok(Date.now() - t0 >= 4500);
+    throwsCode(() => store.withLock(paths, () => 1, { waitMs: 1500 }), 'LOCK_TIMEOUT');
+    assert.ok(Date.now() - t0 >= 1400);
     assert.ok(fs.existsSync(lock), 'live lock must not be removed');
   } finally { done(); }
 });

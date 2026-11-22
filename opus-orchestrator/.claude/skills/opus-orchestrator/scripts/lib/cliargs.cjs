@@ -17,6 +17,7 @@ class ArgError extends Error {
 const BOOLEAN_OPTIONS = new Set([
   'stdin', 'json', 'inline', 'verify', 'integrate', 'plan-only', 'resume', 'status',
   'user-authorized', 'side-effects', 'all', 'requeue-running', 'help',
+  'break', 'confirm-owner-stopped', 'agent-gone', 'accept', 'pid-reused',
 ]);
 
 /**

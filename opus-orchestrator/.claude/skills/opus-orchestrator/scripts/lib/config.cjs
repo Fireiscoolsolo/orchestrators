@@ -34,6 +34,12 @@ const DEFAULTS = {
   },
   verification: {
     regression_command: null,
+    // Commands run before verification, integration and the final audit commands in the same
+    // place (for example installing dependencies in a clean checkout); a failure stops the run.
+    setup_commands: [],
+    // Paths a verification command may create or change without invalidating the evidence.
+    // Files the project's .gitignore ignores count as generated in a git checkout as well.
+    generated_artifacts: ['coverage/', '.nyc_output/', '.pytest_cache/', '**/__pycache__/', '**/*.pyc'],
     modes: {
       fast: { max_parallel: 3, independent_review: { min_complexity: 11, risks: ['high'] }, regression: 'never', final_audit: false, reviewers_high_risk: 1 },
       balanced: { max_parallel: null, independent_review: { min_complexity: 5, risks: ['high'] }, regression: 'risky', final_audit: false, reviewers_high_risk: 1 },
@@ -49,10 +55,18 @@ const DEFAULTS = {
   security: {
     extra_unsafe_patterns: [],
     protected_paths: ['.env', '.env.*', '*.pem', '*.key', 'id_rsa*', '*credentials*', '*secret*'],
+    // Environment variable names a verification command may still see although they look like
+    // credentials (by default such variables are removed from its environment).
+    command_env_allow: [],
   },
 };
 
 const SECTIONS = Object.keys(DEFAULTS);
+const ISOLATIONS = ['auto', 'worktree', 'none'];
+
+function stringList(v) {
+  return Array.isArray(v) && v.every((x) => typeof x === 'string' && x.trim() !== '');
+}
 
 function isPlain(v) {
   return v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -120,6 +134,23 @@ function validateConfig(config) {
   if (!isInt(ex.max_workers, 1, 20)) errors.push('execution.max_workers must be an integer 1-20');
   if (!isInt(ex.max_review_rounds, 0, 10)) errors.push('execution.max_review_rounds must be an integer 0-10');
   if (!isInt(ex.max_retries, 0, 10)) errors.push('execution.max_retries must be an integer 0-10');
+  if (!ISOLATIONS.includes(ex.isolation)) errors.push(`execution.isolation must be one of ${ISOLATIONS.join(', ')} (got ${JSON.stringify(ex.isolation)})`);
+  if (!isInt(ex.command_timeout_seconds, 1, 86400)) errors.push('execution.command_timeout_seconds must be an integer from 1 to 86400');
+
+  const ver = sec('verification');
+  if (ver.regression_command !== null && ver.regression_command !== undefined && !(typeof ver.regression_command === 'string' && ver.regression_command.trim())) {
+    errors.push('verification.regression_command must be null or a non-empty command string');
+  }
+  if (ver.setup_commands !== undefined && !stringList(ver.setup_commands)) errors.push('verification.setup_commands must be a list of non-empty command strings');
+  if (ver.generated_artifacts !== undefined && !stringList(ver.generated_artifacts)) errors.push('verification.generated_artifacts must be a list of non-empty paths or globs');
+  if (stringList(ver.generated_artifacts) && ver.generated_artifacts.some((g) => /^(\*\*\/?|\*|\.\/?|\/)$/.test(g.trim()))) {
+    errors.push('verification.generated_artifacts must not cover the whole project (that would accept any change a command makes)');
+  }
+
+  const secu = sec('security');
+  for (const k of ['extra_unsafe_patterns', 'protected_paths', 'command_env_allow']) {
+    if (secu[k] !== undefined && !stringList(secu[k])) errors.push(`security.${k} must be a list of non-empty strings`);
+  }
 
   const m = sec('models');
   for (const key of ['orchestrator', 'worker_default', 'escalation']) {

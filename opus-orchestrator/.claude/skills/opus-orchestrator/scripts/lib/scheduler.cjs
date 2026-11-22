@@ -188,7 +188,15 @@ function selectBatch(tasks, opts = {}) {
   const deferred = [];
   const chosen = [];
   const exclusiveInFlight = inFlight.some((t) => t.exclusive === true);
+  // Shared workspace: changes of concurrent writers in one directory cannot be attributed, so a
+  // task may enter its evidence window only when no other task's window is open, unless neither
+  // of the two writes. opts.shared_serial = {window: [states], writes: (task) => boolean}.
+  const ss = opts.shared_serial || null;
+  const windowOpen = ss ? tasks.filter((t) => ss.window.includes(t.status)) : [];
   for (const t of cands) {
+    if (ss && (windowOpen.concat(chosen).some((o) => o.task_id !== t.task_id && (ss.writes(o) || ss.writes(t))))) {
+      deferred.push({ task_id: t.task_id, reason: 'shared_serial' }); continue;
+    }
     if (exclusiveInFlight) { deferred.push({ task_id: t.task_id, reason: 'exclusive' }); continue; }
     if (t.exclusive === true && (inFlight.length > 0 || chosen.length > 0)) {
       deferred.push({ task_id: t.task_id, reason: 'exclusive' }); continue;

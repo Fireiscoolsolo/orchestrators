@@ -32,13 +32,16 @@ test('simulated-agent: two independent tasks and one dependent task reach COMPLE
     H.spec('C-001', { title: 'Write C', dependencies: ['A-001', 'B-001'] }),
   ]);
 
-  // wave 1: only the independent tasks
+  // wave 1: in a shared workspace the writers run one at a time (their changes could not be
+  // attributed otherwise); C waits for its dependencies
   let out = step(['next']);
   assert.match(out, /=== A-001 /);
-  assert.match(out, /=== B-001 /);
+  assert.doesNotMatch(out, /=== B-001 /);
+  assert.match(out, /B-001: shared_serial: shared workspace/);
   assert.doesNotMatch(out, /=== C-001 /);
   assert.equal(p.status('C-001'), 'PENDING');
-  step(['started', 'A-001', 'B-001']);
+  assert.equal(p.status('B-001'), 'READY');
+  step(['started', 'A-001']);
   assert.equal(p.status('A-001'), 'RUNNING');
 
   // simulated worker A finishes
@@ -49,6 +52,7 @@ test('simulated-agent: two independent tasks and one dependent task reach COMPLE
 
   out = step(['next']);
   assert.match(out, /NOTHING DISPATCHED: waiting_on_running/);
+  assert.equal(p.status('B-001'), 'READY', 'B still waits while A is being verified in the same directory');
   assert.equal(p.status('C-001'), 'PENDING');
 
   out = step(['verify', 'A-001']);
@@ -59,10 +63,12 @@ test('simulated-agent: two independent tasks and one dependent task reach COMPLE
   out = step(['integrate', 'A-001']);
   assert.match(out, /INTEGRATED: A-001 -> COMPLETED/);
 
-  // A is COMPLETED but B is not: C must still wait
+  // A is COMPLETED but B is not: B is dispatched now, C must still wait
   out = step(['next']);
+  assert.match(out, /=== B-001 /);
   assert.doesNotMatch(out, /=== C-001 /);
   assert.equal(p.status('C-001'), 'PENDING');
+  step(['started', 'B-001']);
 
   // simulated worker B finishes; result --verify and review --integrate chain the steps
   p.write('b-001.txt', 'B\n');
@@ -157,8 +163,12 @@ test('simulated-agent: checkpoint.yaml is rewritten after failure, authorization
   const p = H.project();
   p.ok(['init', 'Checkpoint coverage two']);
   const step = stepper(p);
-  p.plan([H.spec('A-001'), H.spec('B-001'), H.spec('C-001', { complexity: 5 })]);
-  step(['next']);
+  p.plan([H.spec('A-001'), H.spec('B-001'), H.spec('C-001', { complexity: 5, priority: 'high' })]);
+  // shared workspace: one writer at a time, highest priority first
+  assert.match(step(['next']), /=== C-001 [\s\S]*A-001: shared_serial/);
+  p.write('c-001.txt', 'C\n');
+  step(['result', 'C-001', '--stdin', '--verify'], { input: H.report('C-001', { files: ['c-001.txt'] }) });
+  assert.match(step(['next']), /=== A-001 [\s\S]*B-001: shared_serial/);
   step(['worker-failed', 'A-001', '--kind', 'crash', '--reason', 'agent died']);
   step(['authorize', '--limit', 'max_retries', '--value', '4', '--by', 'user', '--reason', 'the user allows more retries']);
   step(['fail', 'B-001', '--reason', 'wrong approach']);
@@ -166,8 +176,6 @@ test('simulated-agent: checkpoint.yaml is rewritten after failure, authorization
   assert.equal(p.status('B-001'), 'READY');
   const f = p.write('.opus-inbox/b.yaml', require('../scripts/lib/yaml.cjs').stringify(H.spec('B-001', { title: 'Amended B' })));
   step(['amend', 'B-001', '--file', f, '--reason', 'clearer title']);
-  p.write('c-001.txt', 'C\n');
-  step(['result', 'C-001', '--stdin', '--verify'], { input: H.report('C-001', { files: ['c-001.txt'] }) });
   step(['review-package', 'C-001']);
   step(['review', 'C-001', '--stdin'], { input: H.review('C-001', { reviewer: 'opus-reviewer', verdict: 'request_changes' }) });
   step(['correct', 'C-001', '--stdin'], { input: H.correction('C-001') });

@@ -93,10 +93,10 @@ function nextActions(run, tasks) {
       const id = t.task_id;
       switch (status) {
         case 'RUNNING':
-          lines.push(`oo result ${id} --stdin (ingest the worker result; if the agent is gone run oo resume --requeue-running)`);
+          lines.push(`oo result ${id} --stdin (ingest the worker result of attempt ${(t.dispatch && t.dispatch.attempt_id) || '?'}; if its agent is known to have stopped: oo reconcile ${id} --attempt ${(t.dispatch && t.dispatch.attempt_id) || '<attempt id>'} --agent-gone --reason <text>)`);
           break;
         case 'DISPATCHED':
-          lines.push(`oo started ${id} once its agent is launched, then oo result ${id} --stdin (if the agent is gone run oo resume --requeue-running)`);
+          lines.push(`oo started ${id} once its agent is launched, then oo result ${id} --stdin (if its agent is known to have stopped: oo reconcile ${id} --attempt ${(t.dispatch && t.dispatch.attempt_id) || '<attempt id>'} --agent-gone --reason <text>)`);
           break;
         case 'IMPLEMENTED':
           lines.push(`oo verify ${id} (run independent verification of the reported result)`);

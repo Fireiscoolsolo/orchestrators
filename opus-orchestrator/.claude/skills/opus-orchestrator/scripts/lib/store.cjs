@@ -1,6 +1,7 @@
 'use strict';
 // store.cjs: atomic persistent run and task store. JSON only, synchronous fs.
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
@@ -12,8 +13,9 @@ class StoreError extends Error {
   }
 }
 
-const LOCK_STALE_MS = 30000;
-const LOCK_WAIT_MS = 5000;
+// How long a command waits for the state lock. Commands hold the lock only for short state
+// transactions; slow work (verification, integration and audit commands) runs outside it.
+const LOCK_WAIT_MS = 15000;
 
 function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -65,10 +67,10 @@ function renameWithRetry(from, to) {
 
 function atomicWrite(file, text) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.tmp-${process.pid}`;
+  const tmp = `${file}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
   let fd;
   try {
-    fd = fs.openSync(tmp, 'w');
+    fd = fs.openSync(tmp, 'wx');
     fs.writeSync(fd, text);
     fs.fsyncSync(fd);
     fs.closeSync(fd);
@@ -274,60 +276,278 @@ function writeEvidence(paths, runId, name, text) {
   return (rel.startsWith('..') || path.isAbsolute(rel) ? file : rel).split(path.sep).join('/');
 }
 
-function pidAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
+// ---------------------------------------------------------------------------
+// State lock
+//
+// The lock file holds one owner record {token, pid, host, acquired_at, kind}. The record is
+// written completely to a private claim file first and then published with a hard link, so no
+// other process ever reads a partly written lock. Rules:
+// - Only the holder of the token releases the lock; a release checks the token first.
+// - A lock is taken over only when its owner is proven dead: same host and the process id no
+//   longer exists (ESRCH). Age never establishes death. A record from another host, a legacy
+//   record without token or host, or an unreadable record is never taken over automatically;
+//   `node manage_state.cjs lock` shows it and `lock --break` moves it aside after the user has
+//   confirmed that its owner stopped.
+// - A takeover is itself guarded: the reaper publishes a guard file named after the dead
+//   owner's token, re-checks the owner under the guard, and moves the lock aside as evidence
+//   (`.lock.reaped-<token>`). A reaper that dies leaves its guard; the next reaper follows a
+//   chain of guards named after their predecessors instead of deleting one, so two reapers can
+//   never both remove a lock. A process id that the operating system reused after the owner
+//   died makes the owner look alive: the lock then waits (and times out) rather than being stolen.
+
+const LOCK_FILE = '.lock';
+const TOKEN_RE = /^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/;
+const held = new Map(); // lock file -> token held by this process
+
+function lockFileOf(paths) {
+  return path.join(paths.stateRoot, LOCK_FILE);
+}
+
+/** {state: 'missing'|'invalid'|'legacy'|'ok', owner?, raw?} for a lock or guard file. */
+function readOwner(file) {
+  let text;
   try {
-    process.kill(pid, 0);
-    return true;
+    const st = fs.lstatSync(file);
+    if (!st.isFile()) return { state: 'invalid', raw: `not a regular file (${st.isDirectory() ? 'directory' : 'other'})` };
+    text = fs.readFileSync(file, 'utf8');
   } catch (e) {
-    return e.code === 'EPERM';
+    if (e.code === 'ENOENT') return { state: 'missing' };
+    return { state: 'invalid', raw: `unreadable: ${e.code || e.message}` };
   }
-}
-
-function lockIsStale(lockFile) {
-  let info = null;
+  let v;
   try {
-    info = JSON.parse(fs.readFileSync(lockFile, 'utf8'));
-  } catch (_) { /* unreadable: judge by mtime */ }
-  let age;
-  if (info && typeof info.ts === 'number') age = Date.now() - info.ts;
-  else {
-    try { age = Date.now() - fs.statSync(lockFile).mtimeMs; } catch (_) { return false; }
+    v = JSON.parse(text);
+  } catch (_) {
+    return { state: 'invalid', raw: text.slice(0, 200) };
   }
-  if (age > LOCK_STALE_MS) return true;
-  if (info && !pidAlive(info.pid)) return true;
-  return false;
+  if (v && typeof v === 'object' && typeof v.token === 'string' && TOKEN_RE.test(v.token)
+    && Number.isInteger(v.pid) && v.pid > 0 && v.pid <= 0x7fffffff && typeof v.host === 'string' && v.host) {
+    return { state: 'ok', owner: v };
+  }
+  if (v && typeof v === 'object' && Number.isInteger(v.pid)) return { state: 'legacy', owner: v };
+  return { state: 'invalid', raw: text.slice(0, 200) };
 }
 
-function withLock(paths, fn) {
-  fs.mkdirSync(paths.stateRoot, { recursive: true });
-  const lockFile = path.join(paths.stateRoot, '.lock');
-  const deadline = Date.now() + LOCK_WAIT_MS;
-  let acquired = false;
-  while (!acquired) {
+/**
+ * 'alive' | 'dead' | 'unknown'. Dead only when the owner ran on this host and its process id no
+ * longer exists. Another host, a legacy record or any doubt is 'unknown', which is never reaped.
+ */
+function ownerState(owner) {
+  if (!owner || typeof owner !== 'object' || typeof owner.host !== 'string' || !Number.isInteger(owner.pid)) return 'unknown';
+  if (owner.host !== os.hostname()) return 'unknown';
+  if (owner.pid === process.pid) return 'alive';
+  try {
+    process.kill(owner.pid, 0);
+    return 'alive';
+  } catch (e) {
+    if (e.code === 'ESRCH') return 'dead';
+    if (e.code === 'EPERM') return 'alive';
+    return 'unknown';
+  }
+}
+
+function sameOwner(a, b) {
+  return !!(a && b && a.token === b.token && a.pid === b.pid && a.host === b.host);
+}
+
+/**
+ * Publishes `record` at `target` only if `target` does not exist. Returns true when published,
+ * false when the target exists. The record is complete before anyone can see it.
+ */
+function publishExclusive(target, record) {
+  const claim = `${target}.claim-${record.token}`;
+  fs.writeFileSync(claim, JSON.stringify(record), { flag: 'wx', mode: 0o600 });
+  try {
     try {
-      const fd = fs.openSync(lockFile, 'wx');
+      fs.linkSync(claim, target);
+      return true;
+    } catch (e) {
+      if (e.code === 'EEXIST') return false;
+      // File systems without hard links: fall back to an exclusive create. A crash between create
+      // and write then leaves an unreadable lock, which is never reaped automatically.
+      if (!['EPERM', 'ENOTSUP', 'EXDEV', 'EINVAL', 'ENOSYS'].includes(e.code)) throw e;
+      let fd;
       try {
-        fs.writeSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() }));
+        fd = fs.openSync(target, 'wx', 0o600);
+      } catch (e2) {
+        if (e2.code === 'EEXIST') return false;
+        throw e2;
+      }
+      try {
+        fs.writeSync(fd, JSON.stringify(record));
+        fs.fsyncSync(fd);
       } finally {
         fs.closeSync(fd);
       }
-      acquired = true;
-    } catch (e) {
-      if (e.code !== 'EEXIST' && e.code !== 'EPERM' && e.code !== 'EACCES') throw e;
-      if (e.code === 'EEXIST' && lockIsStale(lockFile)) {
-        try { fs.unlinkSync(lockFile); } catch (_) { /* raced */ }
-        continue;
-      }
-      if (Date.now() >= deadline) throw new StoreError('LOCK_TIMEOUT', 'could not acquire state lock');
-      sleepSync(25);
+      return true;
+    }
+  } finally {
+    try { fs.unlinkSync(claim); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  }
+}
+
+function newOwner(kind, extra) {
+  return Object.assign({ token: crypto.randomUUID(), pid: process.pid, host: os.hostname(), acquired_at: new Date().toISOString(), kind }, extra || {});
+}
+
+function reconcileError(file) {
+  return new StoreError('LOCK_RECONCILIATION_REQUIRED',
+    `cannot establish the owner of the lock recovery guard ${file}. Stop every oo process of this project, confirm that no owner can still run, then inspect it with node manage_state.cjs lock`);
+}
+
+/** Moves the lock of a dead owner aside. Returns true when it did; false to retry the acquisition. */
+function reap(lockFile, owner) {
+  if (!sameOwner(readOwner(lockFile).owner, owner) || ownerState(owner) !== 'dead') return false;
+  const root = `${lockFile}.reap-${owner.token}`;
+  let predecessor = null;
+  const visited = new Set();
+  for (;;) {
+    const guard = predecessor ? `${root}-${predecessor}` : root;
+    if (visited.has(guard)) throw reconcileError(guard);
+    visited.add(guard);
+    const record = newOwner('lock-reaper', { lock_token: owner.token, predecessor_token: predecessor });
+    const mine = (r) => r.state === 'ok' && sameOwner(r.owner, record) && r.owner.lock_token === owner.token
+      && r.owner.predecessor_token === predecessor;
+    if (!publishExclusive(guard, record)) {
+      const prev = readOwner(guard);
+      if (prev.state === 'missing') return false; // its reaper finished meanwhile: retry the lock
+      if (prev.state !== 'ok' || prev.owner.kind !== 'lock-reaper' || prev.owner.lock_token !== owner.token
+        || prev.owner.predecessor_token !== predecessor) throw reconcileError(guard);
+      if (ownerState(prev.owner) !== 'dead') return false; // a live (or unknown) reaper is working
+      // Never delete an abandoned guard: its token names the only successor guard, so two
+      // reapers that both found it abandoned still cannot both proceed.
+      predecessor = prev.owner.token;
+      continue;
+    }
+    try {
+      if (!mine(readOwner(guard))) throw reconcileError(guard);
+      const cur = readOwner(lockFile);
+      if (cur.state !== 'ok' || !sameOwner(cur.owner, owner) || ownerState(cur.owner) !== 'dead') return false;
+      renameWithRetry(lockFile, `${lockFile}.reaped-${owner.token}`);
+      return true;
+    } finally {
+      if (mine(readOwner(guard))) fs.unlinkSync(guard);
     }
   }
-  try {
-    return fn();
-  } finally {
-    try { fs.unlinkSync(lockFile); } catch (_) { /* ignore */ }
+}
+
+function describeOwner(r) {
+  if (!r || r.state === 'missing') return 'no lock';
+  if (r.state === 'invalid') return `an unreadable lock record (${r.raw})`;
+  const o = r.owner;
+  const who = `process ${o.pid}${o.host ? ` on host ${o.host}` : ''}`;
+  const since = o.acquired_at ? ` since ${o.acquired_at}` : (typeof o.ts === 'number' ? ` since ${new Date(o.ts).toISOString()}` : '');
+  const kind = o.kind ? ` (${o.kind}${o.command ? ` ${o.command}` : ''})` : '';
+  if (r.state === 'legacy') return `a legacy lock record without owner token or host: ${who}${since}`;
+  return `${who}${kind}${since}, owner ${ownerState(o)}`;
+}
+
+/** Acquires the state lock; returns the token. Waits up to opts.waitMs (default LOCK_WAIT_MS). */
+function acquireLock(paths, opts) {
+  fs.mkdirSync(paths.stateRoot, { recursive: true });
+  const lockFile = lockFileOf(paths);
+  if (held.has(lockFile)) throw new StoreError('LOCK_REENTRANT', 'this process already holds the state lock (nested state transactions are not supported)');
+  const o = opts || {};
+  const envWait = Number(process.env.OPUS_ORCH_LOCK_WAIT_MS);
+  const waitMs = Number.isFinite(o.waitMs) ? o.waitMs : (Number.isFinite(envWait) && envWait >= 0 ? envWait : LOCK_WAIT_MS);
+  const deadline = Date.now() + waitMs;
+  const record = newOwner(o.kind || 'oo', o.command ? { command: String(o.command).slice(0, 80) } : null);
+  for (;;) {
+    if (publishExclusive(lockFile, record)) {
+      held.set(lockFile, record.token);
+      return record.token;
+    }
+    const cur = readOwner(lockFile);
+    if (cur.state === 'missing') continue; // released between link and read
+    if (cur.state === 'ok' && reap(lockFile, cur.owner)) continue;
+    if (Date.now() >= deadline) {
+      const e = new StoreError('LOCK_TIMEOUT', `could not acquire the state lock: it is held by ${describeOwner(cur)}`);
+      e.owner = cur.owner || null;
+      e.lockState = cur.state;
+      throw e;
+    }
+    sleepSync(25);
   }
+}
+
+/**
+ * Releases the lock only when it still carries `token`. Returns true when released; false when
+ * the lock is gone or belongs to someone else (it is then left untouched).
+ */
+function releaseLock(paths, token) {
+  const lockFile = lockFileOf(paths);
+  if (held.get(lockFile) === token) held.delete(lockFile);
+  const cur = readOwner(lockFile);
+  if (cur.state !== 'ok' || cur.owner.token !== token) return false;
+  fs.unlinkSync(lockFile);
+  return true;
+}
+
+/** Throws LOCK_LOST unless this process holds the state lock right now. Called before state writes. */
+function assertLockHeld(paths) {
+  const lockFile = lockFileOf(paths);
+  const token = held.get(lockFile);
+  const cur = readOwner(lockFile);
+  if (!token || cur.state !== 'ok' || cur.owner.token !== token) {
+    throw new StoreError('LOCK_LOST', `this process no longer holds the state lock (it is held by ${describeOwner(cur)}); nothing was written`);
+  }
+}
+
+function withLock(paths, fn, opts) {
+  const token = acquireLock(paths, opts);
+  let ok = false;
+  let value;
+  try {
+    value = fn();
+    ok = true;
+  } finally {
+    const released = releaseLock(paths, token);
+    if (ok && !released) {
+      // fn finished, but the lock was taken from us (only possible through a manual break):
+      // its writes may have interleaved with another writer's.
+      throw new StoreError('LOCK_LOST', 'the state lock was taken from this process while it worked; check the run with oo resume');
+    }
+  }
+  return value;
+}
+
+/** Lock inspection for manage_state.cjs: the lock record, its owner state and leftover recovery files. */
+function lockInfo(paths) {
+  const lockFile = lockFileOf(paths);
+  const cur = readOwner(lockFile);
+  let extras = [];
+  try {
+    extras = fs.readdirSync(paths.stateRoot).filter((n) => n.startsWith(`${LOCK_FILE}.`)).sort();
+  } catch (_) { /* no state directory */ }
+  return {
+    file: lockFile, state: cur.state, owner: cur.owner || null, raw: cur.raw || null,
+    owner_state: cur.state === 'ok' ? ownerState(cur.owner) : (cur.state === 'missing' ? null : 'unknown'),
+    description: describeOwner(cur), recovery_files: extras,
+  };
+}
+
+/**
+ * Moves the current lock aside as `.lock.broken-<token or state>-<time>` after a person has
+ * confirmed that its owner stopped. `token` must match the record (or be 'invalid' / 'legacy' for
+ * such records), so a lock that changed hands since it was inspected is never broken.
+ */
+function breakLock(paths, token, opts) {
+  const lockFile = lockFileOf(paths);
+  const cur = readOwner(lockFile);
+  if (cur.state === 'missing') throw new StoreError('NO_LOCK', 'there is no state lock to break');
+  const matches = cur.state === 'ok' ? cur.owner.token === token : cur.state === token;
+  if (!matches) {
+    throw new StoreError('LOCK_MISMATCH', `the lock is held by ${describeOwner(cur)}; --token ${token} does not match it (inspect again with node manage_state.cjs lock)`);
+  }
+  // A process id can be reused by an unrelated program after the owner died; only a person who
+  // checked that the process with that id is not oo can say so (pidReused).
+  if (cur.state === 'ok' && ownerState(cur.owner) === 'alive' && !(opts && opts.pidReused === true && cur.owner.pid !== process.pid)) {
+    throw new StoreError('LOCK_OWNER_ALIVE', `the lock owner, process ${cur.owner.pid} on this host, is still running; stop it first (if that process id now belongs to a program that is not oo, add --pid-reused)`);
+  }
+  const stamp = new Date().toISOString().replace(/[-:.]/g, '');
+  const dest = `${lockFile}.broken-${cur.state === 'ok' ? cur.owner.token : cur.state}-${stamp}`;
+  renameWithRetry(lockFile, dest);
+  return { moved_to: dest, previous: describeOwner(cur) };
 }
 
 function checkIntegrity(paths, runId) {
@@ -388,5 +608,13 @@ module.exports = {
   readEvents,
   writeEvidence,
   withLock,
+  acquireLock,
+  releaseLock,
+  assertLockHeld,
+  lockInfo,
+  breakLock,
+  ownerState,
+  newOwner,
   checkIntegrity,
+  LOCK_WAIT_MS,
 };

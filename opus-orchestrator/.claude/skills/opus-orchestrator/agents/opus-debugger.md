@@ -31,6 +31,7 @@ End with one fenced yaml block, the last thing in the message:
 
 ```yaml
 task_id: <ID>
+attempt_id: '<the attempt id from the package>'   # copy exactly; a report without it is refused
 status: completed            # completed|failed|blocked|needs_decomposition
 summary: 'one or two sentences'
 files_changed: []

@@ -76,7 +76,13 @@ function assertScenario(d) {
   }
   const stepOrder = [...text.matchAll(/^\[ ?(\d+)\/11\]/gm)].map((m) => Number(m[1]));
   assert.deepEqual(stepOrder.filter((n, i) => i === 0 || n !== stepOrder[i - 1]), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
-  assert.match(text, /\[ 4\/11\] verification: oo verify WORD-001 -> exit 0\n\s+oo verify SLUG-001 -> exit 1/);
+  if (d.run.workspace.strategy === 'worktree') {
+    assert.match(text, /\[ 4\/11\] verification: oo verify WORD-001 -> exit 0\n\s+oo verify SLUG-001 -> exit 1/);
+  } else {
+    // shared workspace: SLUG-001 alone first; WORD-001 only after SLUG-001's verification closed its window
+    assert.match(text, /\[ 3\/11\] dispatch of SLUG-001 \(shared workspace: one writer at a time\): oo next -> exit 0/);
+    assert.match(text, /\[ 4\/11\] verification: oo verify SLUG-001 -> exit 1[\s\S]*oo next -> exit 0[\s\S]*oo verify WORD-001 -> exit 0/);
+  }
   assert.match(text, /\[10\/11\] deliver: oo deliver -> exit 0/);
   assert.match(text, /\[11\/11\] final-report: oo final-report -> exit 0/);
   assert.ok(fs.existsSync(d.reportPath), 'the printed final report path exists');
@@ -141,9 +147,20 @@ function assertScenario(d) {
   const at = (id, state) => d.tasks[id].history.find((h) => h.to === state).ts;
   assert.ok(at('SUM-001', 'DISPATCHED') >= at('SLUG-001', 'COMPLETED') && at('SUM-001', 'DISPATCHED') >= at('WORD-001', 'COMPLETED'));
   assert.ok(at('DOC-001', 'DISPATCHED') >= at('SUM-001', 'COMPLETED'));
-  // the two independent tasks were dispatched in the same oo next
-  const batch = d.events.find((e) => e.type === 'dispatch' && e.tasks.length === 2);
-  assert.deepEqual([...batch.tasks].sort(), ['SLUG-001', 'WORD-001']);
+  if (d.run.workspace.strategy === 'worktree') {
+    // the two independent tasks were dispatched in the same oo next (isolated worktrees)
+    const batch = d.events.find((e) => e.type === 'dispatch' && e.tasks.length === 2);
+    assert.deepEqual([...batch.tasks].sort(), ['SLUG-001', 'WORD-001']);
+  } else {
+    // shared workspace: never two writers at once
+    assert.ok(d.events.filter((e) => e.type === 'dispatch').every((e) => e.tasks.length <= 1), 'one task per dispatch in the shared workspace');
+    assert.ok(at('WORD-001', 'DISPATCHED') >= d.tasks['SLUG-001'].history.find((h) => h.from === 'VERIFYING').ts, 'WORD-001 waited for SLUG-001\'s verification');
+  }
+  // every accepted worker report matched the attempt it was dispatched as
+  for (const t of Object.values(d.tasks)) {
+    for (const e of t.attempt_log) assert.match(e.attempt_id, new RegExp(`^${t.task_id}-a${e.attempt}-[0-9a-f]{6}$`));
+    assert.equal(t.result.attempt_id, t.dispatch.attempt_id);
+  }
 
   // final report and delivery
   const report = fs.readFileSync(d.reportPath, 'utf8');

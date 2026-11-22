@@ -2,6 +2,19 @@
 verification:
   # Shell command run for regression checks, or null for none.
   regression_command: null
+  # Commands run first wherever oo runs verification, integration or final audit commands (in
+  # the worktree strategy that is a fresh, clean checkout, so this is the place to install
+  # dependencies, for example 'npm ci'). The first command that fails stops the run.
+  setup_commands: []
+  # Paths a verification command may create or change (files or dir/, globs allowed). Any other
+  # change a command makes to the sources invalidates the evidence. In a git checkout, files the
+  # project's .gitignore ignores also count as generated.
+  generated_artifacts:
+    - "coverage/"
+    - ".nyc_output/"
+    - ".pytest_cache/"
+    - "**/__pycache__/"
+    - "**/*.pyc"
   # Each mode has: max_parallel (cap on workers, null = no cap), independent_review
   # (min_complexity and the risks that trigger a separate reviewer), regression
   # (never, risky or always), final_audit (whole-run audit at the end), and

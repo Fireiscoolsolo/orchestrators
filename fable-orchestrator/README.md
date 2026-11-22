@@ -1,6 +1,6 @@
 # Fable Orchestrator
 
-Fable Orchestrator turns multi-step software requests into task contracts, routes them to workers, and tracks verification, review, corrections, and delivery. V1.1 is an experimental release candidate for supervised use in trusted repositories.
+Fable Orchestrator turns multi-step software requests into task contracts, routes them to workers, and tracks verification, review, corrections, and delivery. Version 1.2.0 is an experimental release for supervised use in trusted repositories.
 
 ## Install
 
@@ -26,9 +26,11 @@ Review the tasks and commands, then use `/fable-orchestrator --resume`. For nati
 ## Verify
 
 ```bash
-node --test .claude/skills/fable-orchestrator/scripts/tests
-node --test .agents/skills/fable-orchestrator/scripts/tests
+node .claude/skills/fable-orchestrator/scripts/run-tests.cjs
+node .agents/skills/fable-orchestrator/scripts/run-tests.cjs
 ```
+
+The runner discovers `scripts/tests/*.test.cjs` explicitly and fails when it finds none, instead of relying on how a Node release treats a directory passed to `node --test`. Use the same commands in CI.
 
 The CLI tests use disposable repositories and worktrees, with workers and reviewers simulated. Claude Code is the integration target. The Codex role definitions and skill preview are experimental, and no Codex execution adapter is included.
 

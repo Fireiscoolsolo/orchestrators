@@ -92,6 +92,18 @@ function validate(skillDir) {
   return problems;
 }
 
+// Never copied: proposal backups, and anything a run or a developer may have left in the source
+// folder (run state, the inbox, worktrees, git data, dependencies).
+const SKIP_TOP = ['history', '.claude', '.opus-inbox', '.git', 'node_modules', 'worktrees'];
+
+function readVersion(dir) {
+  try {
+    return fs.readFileSync(path.join(dir, 'VERSION'), 'utf8').trim();
+  } catch (_) {
+    return 'unknown';
+  }
+}
+
 function plan(opts) {
   const home = process.env.OPUS_ORCH_HOME || os.homedir();
   const base = opts.user ? home : path.resolve(opts.project);
@@ -99,14 +111,24 @@ function plan(opts) {
   const targetSkill = path.join(base, '.claude', 'skills', SKILL_NAME);
   const targetAgents = path.join(base, '.claude', 'agents');
   const actions = [];
+  const conflicts = [];
   const skipSkill = opts.agentsOnly || samePath(srcSkill, targetSkill);
   if (!skipSkill) {
-    for (const rel of listFilesRec(srcSkill, '', ['history'])) {
-      actions.push({ type: 'copy', from: path.join(srcSkill, rel), to: path.join(targetSkill, rel) });
+    // An update must not silently replace files the user changed in the installed copy (an
+    // edited config, an applied improvement proposal, a newer VERSION): a file that exists with
+    // different content is a conflict, replaced only with --overwrite and after a .bak copy.
+    for (const rel of listFilesRec(srcSkill, '', SKIP_TOP)) {
+      const from = path.join(srcSkill, rel);
+      const to = path.join(targetSkill, rel);
+      if (fs.existsSync(to)) {
+        if (fs.readFileSync(from).equals(fs.readFileSync(to))) continue; // already up to date
+        if (!opts.overwrite) { conflicts.push(to); continue; }
+        actions.push({ type: 'backup', from: to, to: to + '.bak' });
+      }
+      actions.push({ type: 'copy', from, to });
     }
   }
   const agentSrc = path.join(srcSkill, 'agents');
-  const conflicts = [];
   if (fs.existsSync(agentSrc)) {
     for (const f of fs.readdirSync(agentSrc).filter((n) => n.endsWith('.md')).sort()) {
       const from = path.join(agentSrc, f);
@@ -119,11 +141,19 @@ function plan(opts) {
       actions.push({ type: 'copy', from, to });
     }
   }
-  return { actions, conflicts, skipSkill, targetAgents, newAgentsDir: !fs.existsSync(targetAgents) };
+  return { actions, conflicts, skipSkill, targetAgents, newAgentsDir: !fs.existsSync(targetAgents), srcSkill, version: readVersion(srcSkill) };
 }
 
 function install(opts, out) {
+  const srcSkill = opts.skillDir ? path.resolve(opts.skillDir) : SOURCE_SKILL_DIR;
+  const problems = validate(srcSkill);
+  if (problems.length) {
+    for (const pr of problems) out(`PROBLEM: ${pr}`);
+    out('The source is not a valid skill directory. Nothing was written.');
+    return 1;
+  }
   const p = plan(opts);
+  out(`Installing ${SKILL_NAME} ${p.version} from ${p.srcSkill}`);
   if (p.conflicts.length) {
     for (const c of p.conflicts) out(`ERROR: ${c} exists with different content; rerun with --overwrite to replace it (a .bak copy is kept)`);
     out('Nothing was written.');
@@ -161,7 +191,7 @@ function main(argv, out) {
     const dir = opts.validateDir || SOURCE_SKILL_DIR;
     const problems = validate(dir);
     if (problems.length) { for (const pr of problems) out(`PROBLEM: ${pr}`); return 1; }
-    out(`OK: ${path.resolve(dir)} is a valid ${SKILL_NAME} skill directory`);
+    out(`OK: ${path.resolve(dir)} is a valid ${SKILL_NAME} skill directory (version ${readVersion(dir)})`);
     return 0;
   }
   if (opts.project === undefined && !opts.user) { out('Usage: install.cjs --project <dir> | --user [--agents-only] [--dry-run] [--overwrite] | --validate [skillDir]'); return 2; }
@@ -170,7 +200,7 @@ function main(argv, out) {
   return install(opts, out);
 }
 
-module.exports = { validate, plan, install, parseFrontmatter, main };
+module.exports = { validate, plan, install, parseFrontmatter, main, SKIP_TOP };
 
 if (require.main === module) {
   process.exitCode = main(process.argv.slice(2), (s) => console.log(s));

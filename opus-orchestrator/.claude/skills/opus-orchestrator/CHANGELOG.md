@@ -2,9 +2,40 @@
 
 Improvement proposals that you approve and apply add their own entries below, with the change, the rationale, the evidence and the rollback command.
 
+## 1.1.0 - 2026-11-22 - security and correctness repairs after the 1.0.0 audit
+
+Every repair has regression tests that drive the real `oo` command line on temporary git repositories and worktrees (`tests/lock.test.cjs`, `tests/candidate.test.cjs`, `tests/review-fixes.test.cjs` and updated suites); the agents in them are simulated.
+
+Critical
+
+- State lock could be stolen. A lock older than 30 seconds was treated as stale, and every release deleted the lock without checking who held it. Now the lock holds a unique owner token, process id and host, published complete; only its holder releases it; it is taken over only when the owner is proven dead on the same host (never because of age); takeovers go through a guard chain that survives a crashed reaper; every state write first checks that the lock is still held (`LOCK_LOST`). `node manage_state.cjs lock` shows the owner; `lock --break --token T --confirm-owner-stopped` moves a lock aside after a person checked (`--pid-reused` when its process id now belongs to an unrelated program).
+- Shared-workspace scope checks approved unauthorized edits: a change outside a task's scope was ignored when it fell inside another task's scope. Authorship is no longer inferred from scopes: a change outside the scope is a violation unless its content is exactly what another task's verified candidate recorded. Writing tasks in a shared workspace now run one at a time (`shared_serial`), because concurrent changes in one directory cannot be attributed. Unrelated edits are left in place; only the evidence is refused.
+
+High
+
+- Shared snapshots were size and modification time, skipped unreadable files and returned nothing for a missing directory. They are now content hashes with an explicit `complete` flag and error list, record symbolic links and junctions without following them, flag names a scope cannot match, include `.git/config` and `.git/hooks`, and an incomplete or old-format snapshot blocks verification. A task keeps the baseline of its first dispatch across retries and correction rounds (`oo rebaseline` resets it, with the user's authorization).
+- `git status` failures read as a clean worktree. Status output is parsed strictly; a failed, denied, truncated or malformed status fails the check.
+- A missing dispatch snapshot made verification trust the worker's own file list, and an isolated task without a worktree got an empty, passing scope. Missing evidence now blocks the task (`evidence_missing`); a task reporting no change in the worktree strategy is verified against the integration head it was given.
+- `oo resume --requeue-running` requeued in-flight tasks on the guess that their agents were gone. Every dispatch now has an attempt id that its report must carry; late, duplicate, abandoned and foreign reports are refused; `--requeue-running` refuses and `oo reconcile <ID> --attempt <AID> --agent-gone --reason T` requeues one attempt explicitly. Interrupted verifications, integrations and deliveries are recorded as operations with an owner and are taken over only when that owner is dead (or with `--takeover <op id>`); results of superseded operations are discarded.
+- Verification and delivery were not bound to an immutable candidate. A report no longer establishes worktree ownership: oo checks the worktree (this repository, not the main checkout or integration worktree, not bound to another attempt, not on the base or integration branch) and pins its HEAD commit and tree. Verification runs in a fresh, clean detached checkout of that commit; commands that change sources invalidate the evidence (explicit `verification.generated_artifacts` policy, git-ignored files allowed); `verification.setup_commands` run first and a failure stops the run. Integration merges exactly the verified and approved commit in a clean checkout, runs the checks on that merge commit and only then fast-forwards the integration branch to it (recoverable after a crash between the two). A dirty integration worktree, an unfinished git operation or an integration branch moved by someone else blocks integration. Delivery fast-forwards to exactly the integrated and audited commit and forces nothing. Changed git configuration, hooks or info files since `oo init` stop verification, integration and delivery (`oo repo-guard`).
+
+Medium
+
+- Independent reviews were not bound to a dispatch. Each review package is now a dispatch bound to task, attempt, round, perspective and verified candidate; the report carries its `review_id`; `oo review --agent-id <id>` records the host's agent id, and reviews from the worker's agent or a second report from the same agent are refused; `oo review-abandon` replaces a lost reviewer and refuses its late report.
+- The reviewer agent had `Bash`. It now has Read, Glob and Grep only, and gets a pinned evidence file with the exact verified diff or content (protected paths listed without content).
+- Verification commands inherited credential-like environment variables; they are now removed (names recorded in the evidence; `security.command_env_allow` to keep one). Verification commands stop at the first failure.
+- The final audit ran while holding the state lock; slow commands now run outside it.
+- Installer updates silently replaced files the user had changed in the installed skill (configuration, applied proposals, `VERSION`) and could copy run state found in the source folder. Changed files are now conflicts (replaced only with `--overwrite`, after a `.bak` copy), the source is validated first, run state is never copied, and the installer prints the version.
+- The PreCompact hook wrote the checkpoint without the state lock.
+- Configuration did not validate `execution.isolation`, `command_timeout_seconds`, `verification.regression_command` or the security lists.
+
+Findings of the independent review of these repairs, also fixed: a reused process id made a stale lock or operation unrecoverable; a changed shared candidate at integration hit an invalid state transition; the repository guard was not re-checked before the fast-forwards that follow candidate commands; protected files appeared in the pinned diff; clean checkouts with only generated artifacts were left behind; `.git/info/exclude` was not guarded.
+
+Behaviour changes: writing tasks in a shared workspace no longer run in parallel; worker reports need `attempt_id`; independent reviews need `review_id` and `--agent-id`; `oo result --branch` is informational only; `oo resume --requeue-running` refuses (use `oo reconcile`); runs created by an earlier version cannot be integrated or verified with the new evidence rules and should be finished by hand or restarted.
+
 ## 1.0.0 - 2026-11-16
 
-First release of the skill.
+First public release of the skill (release tag `opus-v1.0.0`). Earlier local drafts of this changelog labelled this release 2.0.0 after the "V2" design document; the published version is 1.0.0, and "V2" remains only the name of the architecture in `DESIGN.md`.
 
 Added
 

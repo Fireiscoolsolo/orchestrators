@@ -194,3 +194,25 @@ test('validate_config.cli: OK for shipped config, exit 1 for invalid override', 
     assert.doesNotMatch(bad.stdout, /CONFIG OK/);
   } finally { fs.rmSync(d, { recursive: true, force: true }); }
 });
+
+test('regression: isolation, command timeout, regression command, setup commands, generated artifacts and security lists are validated', () => {
+  const bad = (mutate) => {
+    const cfg = JSON.parse(JSON.stringify(DEFAULTS));
+    mutate(cfg);
+    return validateConfig(cfg).errors.join('\n');
+  };
+  assert.deepEqual(validateConfig(DEFAULTS).errors, []);
+  assert.deepEqual(DEFAULTS.verification.setup_commands, []);
+  assert.ok(DEFAULTS.verification.generated_artifacts.includes('coverage/'));
+  assert.deepEqual(DEFAULTS.security.command_env_allow, []);
+  assert.match(bad((c) => { c.execution.isolation = 'sometimes'; }), /execution\.isolation must be one of auto, worktree, none/);
+  assert.match(bad((c) => { c.execution.command_timeout_seconds = 0; }), /command_timeout_seconds must be an integer from 1 to 86400/);
+  assert.match(bad((c) => { c.execution.command_timeout_seconds = -5; }), /command_timeout_seconds/);
+  assert.match(bad((c) => { c.verification.regression_command = ''; }), /regression_command must be null or a non-empty command string/);
+  assert.match(bad((c) => { c.verification.setup_commands = 'npm ci'; }), /setup_commands must be a list/);
+  assert.match(bad((c) => { c.verification.generated_artifacts = ['**']; }), /must not cover the whole project/);
+  assert.match(bad((c) => { c.verification.generated_artifacts = ['*']; }), /must not cover the whole project/);
+  assert.match(bad((c) => { c.security.command_env_allow = [1]; }), /security\.command_env_allow must be a list of non-empty strings/);
+  assert.match(bad((c) => { c.security.protected_paths = '.env'; }), /security\.protected_paths must be a list/);
+  assert.equal(bad((c) => { c.execution.isolation = 'none'; c.verification.regression_command = 'npm test'; c.verification.setup_commands = ['npm ci']; }), '');
+});

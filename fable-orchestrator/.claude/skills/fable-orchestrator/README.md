@@ -99,8 +99,10 @@ Runtime state and the inbox can contain excerpts of your code and command output
 ## Tests
 
 ```bash
-node --test .claude/skills/fable-orchestrator/scripts/tests/
+node .claude/skills/fable-orchestrator/scripts/run-tests.cjs
 ```
+
+The runner lists `scripts/tests/*.test.cjs` itself and exits non-zero when it finds none, so the result does not depend on how a Node release treats a directory passed to `node --test`. Extra arguments go to `node --test`, for example `--test-reporter=tap`.
 
 The suite covers the YAML subset, contracts, routing, scheduling, worktree ownership, immutable candidates, independent review and reviewer recovery, shared workspace integrity, state and lock recovery, installation, and complete CLI runs in real Git repositories. These tests simulate workers. Read the test runner totals and the release validation report for executed counts and separate live-host evidence.
 

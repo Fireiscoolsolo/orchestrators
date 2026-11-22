@@ -2,7 +2,7 @@
 
 A Claude Code skill that turns one request with several objectives into task specifications, runs them through Haiku-first worker subagents in dependency order (in parallel where the scopes do not overlap), verifies and reviews every result, and keeps Opus as architect and final approver. The rules that matter are enforced by a command line, `oo`, not by prose: it owns the task state machine, routing, scheduling, verification runs, git integration, budgets and the persisted state.
 
-Version 1.0.0. Read "Verification status" and "Limitations" before relying on it: only one live Claude Code run has been made, and several parts have never run against real agents.
+Version 1.1.0. Read "Verification status" and "Limitations" before relying on it: only one live Claude Code run has been made, and several parts have never run against real agents.
 
 ## Contents
 
@@ -54,7 +54,7 @@ node .claude/skills/opus-orchestrator/scripts/install.cjs --project <dir> --over
 node .claude/skills/opus-orchestrator/scripts/install.cjs --validate
 ```
 
-Exit codes: 0 success, 1 a conflict or a validation problem (it names each one), 2 a usage error. If an agent file already exists with different content and `--overwrite` is not given, nothing at all is written.
+Exit codes: 0 success, 1 a conflict or a validation problem (it names each one), 2 a usage error. The installer validates the source first and prints the version it installs. If a skill or agent file already exists with different content (for example a configuration you edited or a proposal you applied in the installed copy) and `--overwrite` is not given, nothing at all is written; with `--overwrite` each replaced file is kept as `.bak`. Run state, the inbox and proposal history found in the source folder are never copied.
 
 When `.claude/agents/` does not exist yet, the installer says so: Claude Code must be restarted before it loads a brand-new agents directory.
 
@@ -129,13 +129,14 @@ It prints `CONFIG OK` and exits 0, or prints each error and exits 1. Unknown top
 | | `parallel_execution` | true | false runs one task at a time |
 | | `persistent_checkpoints` | true | declared; see note below |
 | | `independent_verification` | true | false skips independent review for low-risk tasks |
-| | `isolation` | `auto` | `auto` or `worktree` use worktrees when possible; any other value (for example `none`) means shared |
-| | `command_timeout_seconds` | 600 | per verification command |
+| | `isolation` | `auto` | `auto` or `worktree` use worktrees when possible (git 2.31 or later); `none` means shared; other values are rejected |
+| | `command_timeout_seconds` | 600 | per verification command (1-86400) |
 | | `improvement.collect_observations` | true | whether `oo learn` records the run's outcomes |
 | | `improvement.auto_modify_core_skill` | false | must stay false; validation rejects true |
 | | `improvement.min_samples` | 5 | observations a rule needs before it proposes anything |
 | | `security.extra_unsafe_patterns` | `[]` | extra regular expressions that mark a command unsafe |
-| | `security.protected_paths` | `.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa*`, `*credentials*`, `*secret*` | specifications may not authorize these unless `security_sensitive: true` |
+| | `security.protected_paths` | `.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa*`, `*credentials*`, `*secret*` | specifications may not authorize these unless `security_sensitive: true`; never copied into pinned review evidence |
+| | `security.command_env_allow` | `[]` | credential-like environment variables are removed from verification commands unless listed here |
 | `models.yaml` | `orchestrator`, `worker_default`, `escalation` | opus, haiku, opus | aliases only: haiku, sonnet, opus |
 | | `allowed` | haiku, sonnet, opus | other names are rejected |
 | | `relative_cost` | 1, 3, 5 | unitless planning weights, not prices |
@@ -147,6 +148,8 @@ It prints `CONFIG OK` and exits 0, or prints each error and exits 1. Unknown top
 | | `token_limit`, `cost_limit_usd`, `agent_call_limit` | null | null means no limit set by the skill |
 | | `warning_threshold_percent` | 80 | |
 | `verification.yaml` | `regression_command` | null | shell command for regression checks and the final audit |
+| | `setup_commands` | `[]` | run first wherever verification, integration or audit commands run (a clean checkout in the worktree strategy, so for example `npm ci`); the first failure stops the run |
+| | `generated_artifacts` | `coverage/`, `.nyc_output/`, `.pytest_cache/`, `**/__pycache__/`, `**/*.pyc` | paths commands may change; any other change to the sources invalidates the evidence (git-ignored files also count as generated in a checkout) |
 | | `modes.<mode>` | see `references/verification-policy.md` | max_parallel, independent_review, regression, final_audit, reviewers_high_risk |
 | `compaction.yaml` | `context.mode` | `balanced` | aggressive targets 0.40, balanced 0.60, custom uses `target_utilization` |
 | | `target_utilization` | 0.60 | strictly between 0 and 1 |
@@ -163,7 +166,7 @@ verification:
   regression_command: 'npm test'
 ```
 
-Environment variables read by the scripts: `OPUS_ORCH_PROJECT_DIR` (project root; default the current directory), `OPUS_ORCH_STATE_DIR` (state directory), `OPUS_ORCH_HOME` (home directory for `install.cjs --user` and for finding user-level agents) and `OPUS_ORCH_SHELL` (verification shell).
+Environment variables read by the scripts: `OPUS_ORCH_PROJECT_DIR` (project root; default the current directory), `OPUS_ORCH_STATE_DIR` (state directory), `OPUS_ORCH_HOME` (home directory for `install.cjs --user` and for finding user-level agents), `OPUS_ORCH_SHELL` (verification shell) and `OPUS_ORCH_LOCK_WAIT_MS` (how long a command waits for the state lock; default 15000).
 
 ## Where state lives
 
@@ -184,12 +187,15 @@ All run state is under `.claude/opus-orchestrator/` of the project, which `oo` c
     reports/               worker reports as accepted
     reviews/               review reports
     evidence/              verification, integration and final-audit output
-    snapshots/             file snapshots taken at dispatch (shared workspace)
+    snapshots/             content-hash baselines taken at a task's first dispatch (shared workspace)
     events.jsonl           append-only event log
     checkpoint.yaml        rewritten after every change
     final-report.md        written by oo final-report
     worktrees/integration  the integration worktree (worktree strategy)
+    worktrees/verify-*, integrate-*, audit-*   oo's own clean checkouts; removed after use unless kept as evidence
 ```
+
+`node .claude/skills/opus-orchestrator/scripts/manage_state.cjs lock` shows who holds the state lock and whether that process is alive; `lock --break --token T --confirm-owner-stopped` moves a lock aside only after you confirmed no `oo` process of the project still runs.
 
 Every file is written atomically with a `.bak` copy of the previous version; `oo resume` restores a damaged file from it. Inspect state without changing it:
 
@@ -235,7 +241,7 @@ node .claude/skills/opus-orchestrator/scripts/run_tests.cjs
 node .claude/skills/opus-orchestrator/scripts/run_tests.cjs yaml
 ```
 
-It runs every `tests/*.test.cjs` with `node --test` and exits 0 only when all passed. Run the simulated demonstration, which drives `oo` through the eleven-step scenario of the specification (two independent tasks run together, a dependent task, a documentation task, an acceptance test that fails first, a correction cycle, integration, final report) in a temporary copy of `demo/project`:
+It lists every `tests/*.test.cjs` explicitly, runs them with `node --test`, and exits 0 only when all passed (1 when no test file matches). Failure paths that cannot be produced on demand (a denied or malformed `git status`, a crash right after a fast-forward) are injected by preloading `tests/faults/git-faults.cjs` into a real `oo` process; the production code has no test hooks. `.github/workflows/ci.yml` at the repository root runs the suite, the installer validation and both demonstrations on Windows and Ubuntu. Run the simulated demonstration, which drives `oo` through the eleven-step scenario of the specification (two independent tasks run together, a dependent task, a documentation task, an acceptance test that fails first, a correction cycle, integration, final report) in a temporary copy of `demo/project`:
 
 ```bash
 node .claude/skills/opus-orchestrator/scripts/demo.cjs          # shared workspace
@@ -253,7 +259,7 @@ Taken from runs made while writing this document (2026-11-16, Windows 11, Node 2
 
 | Kind | What | Result |
 |---|---|---|
-| Unit and module tests | 439 tests in 25 files, run with `run_tests.cjs`: library modules (yaml, state machine, spec, routing, scheduler, security, verify, reports, budget, checkpoint, store, config, improve, gitops against real temporary git repositories), installer, hooks, the `oo` command line | 439 passed, 0 failed, about 25 seconds |
+| Unit and module tests | 479 tests in 28 files, run with `run_tests.cjs` (2026-11-21, after the audit repairs; 439 at the 1.0.0 release): library modules (yaml, state machine, spec, routing, scheduler, security, verify, reports, budget, checkpoint, store and lock, config, improve, gitops against real temporary git repositories), installer, hooks, the `oo` command line including candidate binding, reconciliation and fault injection | 478 passed, 0 failed, 1 skipped (a file-name case that Windows cannot create), about 60 seconds on Windows 11, Node 26.12.1, git 2.56. Ubuntu is covered by `.github/workflows/ci.yml` but was not run during the audit. |
 | Simulated-agent tests | 31 of those 439 are named `simulated-agent:`. They drive `oo` with workers and reviewers that are test code feeding YAML reports; `tests/e2e_simulated.test.cjs` runs `demo.cjs` in both workspace strategies. The `demo.cjs` runs themselves: shared workspace and `--git` | All passed; both demo runs exit 0 with four tasks COMPLETED. This shows that the state machine, verification, correction and integration work when fed well-formed reports. It does not show that real agents produce them. |
 | Live Claude Code integration | 3 headless sessions with real subagents (see below) | Observed and not observed steps listed below |
 | Manual verification | Commands run by hand: `oo help`, `oo doctor`, `oo version`, `install.cjs --validate` and `--dry-run` (project, user, agents-only), `validate_config.cjs`, `schedule_tasks.cjs`. From the live setup, observed in the build session only and not saved as evidence: tool versions, `install.cjs --validate` exit 0 on the installed copy, the fixture's 11 of 11 failing tests before the run | As described |
@@ -302,6 +308,8 @@ Defects the live run found, since fixed and covered by automated regression test
 
 Also not exercised live, from this document's own checks: the changes made after the live run (tolerant YAML escapes, single-quote instructions and the resend refusal, correction `verification_commands`, project-relative reported paths, self-implemented task worktrees under `.opus-inbox/worktrees/`, the final audit in `oo deliver`, the high-risk reviewer count, deduplicated `oo learn`, `oo context` source recording and `oo authorize` raising rules). They are in the automated suite only.
 
+The repairs after the 1.0.0 audit (locks, evidence, candidate binding, attempt and review identities; see `CHANGELOG.md` and `SECURITY.md`) are covered by automated tests with simulated agents only; no live run was made after them.
+
 The skill should not be called production-ready: critical paths named above have not passed a live test.
 
 ## Limitations
@@ -318,15 +326,16 @@ Specifications, reports and commands
 - **The YAML subset.** `oo` reads a documented subset: block mappings and sequences, plain, single- and double-quoted scalars, numbers, booleans, null, comments, `|` and `>` block scalars, single-line flow collections. Anchors, aliases, tags, tab indentation, multi-line flow or plain scalars and duplicate keys are errors. Quoting pitfalls that change meaning: an unquoted `: ` inside a list item turns it into a mapping (`oo` rejects it); an unquoted ` #` silently drops the rest of the line; a value starting with `*`, `&`, `!`, `[` or `{` is read as an alias, anchor, tag or collection. Unknown backslash escapes in double-quoted strings are now kept literally, but single quotes are the safe choice for paths and regular expressions, and the worker packages ask for them.
 - **Command safety is a guard, not a sandbox.** Verification and correction commands are matched against patterns for destructive or publishing commands (`git push`, `git reset --hard`, `git clean`, `--force`, `sudo`, piping a download into a shell, `rm -rf` of a root, home or `.`, `npm publish`, `docker push`, `terraform apply`, `kubectl apply` and similar) plus your `security.extra_unsafe_patterns`. A command that is allowed runs with all the rights of your user. An obfuscated command, or a script that does the damage itself, is not caught: for example `python -c` calling `shutil.rmtree`, or a command decoded and evaluated at run time, passes the check.
 - **Secret redaction has gaps.** `oo` redacts private-key blocks, `Bearer` tokens, tokens with well-known prefixes (such as `sk-`, `ghp_`, `AKIA`, `AIza`), long mixed-case tokens and assignments whose name contains KEY, TOKEN, SECRET, PASSWORD or PASSWD, in what it records (reports, reviews, evidence output, commands). It does not redact a password inside a URL, a value under another name (`auth=...`, `pw=...`), a `password: value` line in lower case, basic-auth headers, short numeric values or lowercase hexadecimal strings. It does not scan files that workers write, and it does not stop a worker or the orchestrator from seeing a secret. `protected_paths` only keeps matching files out of a specification's authorized files. Keep secrets out of requests and out of the project files that workers read.
-- **Shared-workspace scope checks are snapshot based.** Without git, `oo` stores a snapshot of file sizes and modification times at dispatch and compares at verification. A change inside another task's scope that overlapped in time is attributed to that task and ignored, so a worker's out-of-scope edit that happens to fall inside a concurrent task's scope is not reported. The comparison uses size and modification time, not content. In the worktree strategy the scope is the git diff of the worker's commit instead.
-- **Reviewer and researcher roles are read-only by instruction and tool list.** The reviewer agent has `Bash` in its tools, so "does not modify files" rests on its instructions as well as on the tool list.
+- **Shared-workspace scope checks are snapshot based, and shared writers are serialized.** Without git, `oo` hashes every file when a task is first dispatched and compares at verification; an incomplete snapshot blocks the task. A change outside the scope is a violation unless it is exactly the content another task's verified candidate recorded. Because concurrent changes in one directory cannot be attributed, writing tasks in a shared workspace run one at a time; use a git repository for parallel work. In the worktree strategy the scope is the git diff of the pinned candidate commit instead.
+- **Reviewer and researcher roles are read-only by tool list.** Neither installed agent has a shell; the reviewer reads a pinned evidence file instead of running commands. The `general-purpose` fallback used when the agents are not installed has a shell. See `SECURITY.md` for what is enforced and what is only screened.
 
 Environment
 
 - **Hooks from other plugins.** Other plugins' hooks run in the same session and can reject or alter a call. In the live run another plugin's hook rejected the first `oo` call of two sessions; the session then retried. This skill's own hooks are registered for the session only after the skill is invoked, and only fire on a compaction.
 - **Agents need installation outside the skill folder.** `.claude/agents/` or `~/.claude/agents/`, and a Claude Code restart if that directory is new. Without them the `general-purpose` fallback is used.
 - **`.claude` is write-protected for Claude Code's file tools.** Run state is therefore written only by `oo`, and drafts go to `.opus-inbox/`. A task the orchestrator does itself in the worktree strategy uses a worktree under `.opus-inbox/worktrees/`.
-- A run holds one state lock while a command works. `oo deliver` runs the final audit while holding it, and another `oo` process treats a lock older than 30 seconds as stale, so do not start other `oo` commands during a long audit. This is read from the code, not tested.
+- A run holds one state lock only for short state changes; verification, integration and audit commands run outside it and their results are applied only if their operation is still current. A lock is never taken from a live owner and never because of its age. A process id reused by an unrelated program makes a dead owner look alive; `node scripts/manage_state.cjs lock` then shows how to recover after a person checked. Commands wait up to 15 seconds for the lock (`OPUS_ORCH_LOCK_WAIT_MS`).
+- Runs started before the audit repairs have no candidates, baselines or recorded integration head; finish them by hand or start a new run.
 - `oo next` still prints the worker model in its heading for a task the orchestrator does itself (`DO YOURSELF`); no agent is launched for it.
 - Agent teams are experimental and off by default in Claude Code; the skill does not use them.
 - Untested scenarios: everything under "Not tested live".
@@ -335,7 +344,7 @@ Environment
 
 ```text
 SKILL.md                  the orchestrator's instructions and frontmatter
-README.md  CHANGELOG.md  VERSION
+README.md  CHANGELOG.md  SECURITY.md  VERSION
 config/                   models, routing, budgets, verification, compaction, execution (YAML)
 agents/                   opus-researcher, opus-implementer, opus-tester, opus-reviewer, opus-debugger
 templates/                task, agent-result, review-report, correction-request, checkpoint, improvement-proposal

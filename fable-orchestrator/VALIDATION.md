@@ -1,4 +1,29 @@
-# v1.1.0 candidate validation
+# Validation
+
+## v1.2.0 audit repair, 2026-11-21
+
+Readiness classification: **Experimental**, unchanged. Executed on Windows with Node.js 26.12.1 and Git 2.56.0.windows.4.
+
+| Check | Passed | Failed | Skipped |
+| --- | ---: | ---: | ---: |
+| Baseline, Claude skill layout (`node --test <dir>`) | 124 | 0 | 0 |
+| Baseline, Codex preview layout | 124 | 0 | 0 |
+| Final, Claude skill layout (`scripts/run-tests.cjs`, 11 files) | 139 | 0 | 0 |
+| Final, Codex preview layout | 139 | 0 | 0 |
+
+Fifteen regressions in `scripts/tests/audit-regressions.test.cjs` cover the repairs listed in the changelog. The reproductions were first run against the unrepaired CLI. A stale manual check reached REVIEWING through `--reverify` inside an open cycle. A shared task's correct retry failed its scope check on another task's integrated file. Fault-injection tests run the real CLI with a preload that fails one state commit or file write. They show that a failed commit leaves no review diff or report copy, an unwritable review diff retires its unissued dispatch, interrupted verification logs are never named by state, and a dispatch retry takes over only an unmodified leftover worktree. An independent review of the changed code found a scheduling deadlock in the first shared-ownership repair. It was fixed, and its regression test fails against the deadlocking logic. The review confirmed that the five reverify and manual-check regressions fail against the pre-audit code.
+
+Classification of the other audited areas:
+- Candidate identity and delivered SHA, dirty and untracked influence, worker attempt and worktree ownership, reviewer independence and replacement, and installation ownership: no new defect was found by reading.
+- Suspected risks, now documented in [limitations](LIMITATIONS.md):
+  - A detached verification checkout that a command leaves untracked files in is not removed.
+  - A correction's narrower scope is advisory.
+  - In shared mode, edits left by a failed or cancelled task carry into later baselines.
+  - A worktree leftover whose start commit moved before the retry is refused rather than taken over.
+
+Still unverified: live Claude Code dispatch and review (no authorized live budget in this session), Linux, and Node versions other than 26. The repository CI workflow mentioned below is not present on this machine, so it was not run. `scripts/run-tests.cjs` is the invocation it should use.
+
+## v1.1.0-rc.1 historical record, 2026-11-18
 
 Validation completed on 2026-11-18. Readiness classification: **Experimental**. This is a local release candidate, not a published v1.1.0 release. No license has been selected or applied.
 

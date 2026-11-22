@@ -1,0 +1,51 @@
+name: Opus Orchestrator
+
+on:
+  push:
+    paths:
+      - 'opus-orchestrator/**'
+      - '.github/workflows/opus.yml'
+  pull_request:
+    paths:
+      - 'opus-orchestrator/**'
+      - '.github/workflows/opus.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [22, 24]
+    defaults:
+      run:
+        shell: bash
+        working-directory: opus-orchestrator
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Git identity for the temporary test repositories
+        run: |
+          git config --global user.name "CI"
+          git config --global user.email "ci@example.invalid"
+          git config --global init.defaultBranch main
+          git --version
+      - name: Skill structure and version
+        run: node .claude/skills/opus-orchestrator/scripts/install.cjs --validate
+      - name: Configuration
+        run: node .claude/skills/opus-orchestrator/scripts/validate_config.cjs
+      # run_tests.cjs lists tests/*.test.cjs explicitly and exits 1 when no test file is found
+      - name: Test suite
+        run: node .claude/skills/opus-orchestrator/scripts/run_tests.cjs
+      - name: Simulated demonstration, shared workspace
+        run: node .claude/skills/opus-orchestrator/scripts/demo.cjs
+      - name: Simulated demonstration, worktree strategy
+        run: node .claude/skills/opus-orchestrator/scripts/demo.cjs --git

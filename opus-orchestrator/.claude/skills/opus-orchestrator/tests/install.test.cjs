@@ -124,6 +124,55 @@ test('--overwrite backs up the old agent file first', () => {
   assert.equal(fs.readFileSync(existing, 'utf8'), AGENT('opus-b'));
 });
 
+test('regression: an update refuses to replace skill files the user changed, keeps a .bak with --overwrite, and never copies run state', () => {
+  const root = tmp();
+  const src = makeSkill(root);
+  write(path.join(src, '.claude', 'opus-orchestrator', 'runs', 'r', 'run.json'), '{"secret": "run state"}');
+  write(path.join(src, '.opus-inbox', 'draft.md'), 'draft');
+  const proj = path.join(root, 'proj');
+  let r = run(src, ['--project', proj]);
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /Installing opus-orchestrator 1\.2\.3 from /);
+  const t = path.join(proj, '.claude', 'skills', 'opus-orchestrator');
+  assert.ok(!fs.existsSync(path.join(t, '.claude')), 'run state is not installed');
+  assert.ok(!fs.existsSync(path.join(t, '.opus-inbox')), 'the inbox is not installed');
+  // the user applies a proposal in the installed copy: VERSION and a file change
+  write(path.join(t, 'VERSION'), '1.2.4\n');
+  write(path.join(t, 'references', 'a.md'), 'user edit');
+  // the source moves on as well
+  write(path.join(src, 'templates', 't.yaml'), 't v2');
+  r = run(src, ['--project', proj]);
+  assert.equal(r.status, 1, r.stdout);
+  assert.match(r.stdout, /VERSION exists with different content/);
+  assert.match(r.stdout, /references[\\/]a\.md exists with different content/);
+  assert.match(r.stdout, /Nothing was written/);
+  assert.equal(fs.readFileSync(path.join(t, 'references', 'a.md'), 'utf8'), 'user edit');
+  assert.equal(fs.readFileSync(path.join(t, 'templates', 't.yaml'), 'utf8'), 't', 'not even the unconflicted file was written');
+  r = run(src, ['--project', proj, '--overwrite']);
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.equal(fs.readFileSync(path.join(t, 'references', 'a.md.bak'), 'utf8'), 'user edit');
+  assert.equal(fs.readFileSync(path.join(t, 'VERSION.bak'), 'utf8'), '1.2.4\n');
+  assert.equal(fs.readFileSync(path.join(t, 'templates', 't.yaml'), 'utf8'), 't v2');
+});
+
+test('an invalid source skill is refused before anything is written', () => {
+  const root = tmp();
+  const src = makeSkill(root, { version: 'banana\n' });
+  const proj = path.join(root, 'proj');
+  const r = run(src, ['--project', proj]);
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /VERSION is not a semantic version[\s\S]*Nothing was written/);
+  assert.ok(!fs.existsSync(proj));
+});
+
+test('the shipped skill validates and reports version 1.1.0', () => {
+  const r = spawnSync(process.execPath, [INSTALL, '--validate'], { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /is a valid opus-orchestrator skill directory \(version 1\.1\.0\)/);
+  const v = spawnSync(process.execPath, [path.resolve(__dirname, '..', 'scripts', 'oo.cjs'), 'version'], { encoding: 'utf8', env: { ...process.env, OPUS_ORCH_PROJECT_DIR: tmp() } });
+  assert.match(v.stdout, /^opus-orchestrator 1\.1\.0$/m);
+});
+
 test('identical existing agent file is not a conflict', () => {
   const root = tmp();
   const src = makeSkill(root);

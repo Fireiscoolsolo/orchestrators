@@ -59,7 +59,7 @@ Runtime state (git-ignored through its own `.gitignore`, never committed):
     request.md, plan.md, final-report.md
     tasks/<ID>.yaml        contracts as submitted
     reports/ reviews/ corrections/   what workers and reviewers returned
-    evidence/*.log         full output and exit code of every command fo ran
+    evidence/*.log         full output and exit code of every command fo ran, named per operation; state holds each accepted log's digest
     integration/           git worktree of the run's integration branch
     wt/                    checkouts fo creates for verification or managed isolation
 ```

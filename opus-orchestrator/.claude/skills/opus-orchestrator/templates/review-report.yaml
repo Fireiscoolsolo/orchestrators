@@ -1,5 +1,6 @@
 # Review report from an independent reviewer (synthetic values)
 task_id: DEMO-001
+review_id: 'DEMO-001-r1-a1b2c3'   # copied from the review package; not needed when reviewer is orchestrator
 reviewer: opus-reviewer      # or "orchestrator"
 verdict: request_changes     # approve|request_changes|reject
 criteria:                    # exactly one entry per acceptance criterion, in order

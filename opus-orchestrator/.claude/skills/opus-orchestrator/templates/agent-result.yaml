@@ -8,7 +8,7 @@ self_check:                  # one entry per acceptance criterion, in order (req
     evidence: 'test "greets by name" passes'   # what you saw; single-quoted, paths with forward slashes
 commands_run:                # commands you ran
   - {command: 'node --test tests/greet.test.js', exit_code: 0}
-commit: null                 # commit sha when working in a git worktree
-branch: null                 # branch name in a worktree
+commit: null                 # commit sha in a git worktree (compared, never trusted: oo pins the worktree's HEAD)
+branch: null                 # branch name in a worktree (informational)
 issues: []                   # things the orchestrator must know, incl. denied tools
 proposed_subtasks: []        # only with needs_decomposition

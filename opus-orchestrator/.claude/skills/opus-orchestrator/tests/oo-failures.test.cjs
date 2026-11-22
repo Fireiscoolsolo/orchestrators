@@ -42,7 +42,8 @@ test('simulated-agent: result rejects a malformed or mismatched report with exit
 });
 
 test('simulated-agent: worker-failed retries up to max_retries then FAILED; permission and budget block without retry', () => {
-  const p = H.project({ config: 'execution:\n  max_retries: 2\n' });
+  // worktree strategy: the four writers are dispatched together (a shared workspace serializes them)
+  const p = H.project({ git: true, config: 'execution:\n  max_retries: 2\n' });
   p.ok(['init', 'Retries']);
   p.plan([H.spec('A-001'), H.spec('B-001'), H.spec('C-001'), H.spec('D-001')]);
   p.ok(['next']);
@@ -115,25 +116,30 @@ test('simulated-agent: review approve is refused while verification has not pass
     H.spec('B-001', { verification_commands: [H.FAIL_CMD] }),
     H.spec('C-001', { complexity: 5 }),
   ]);
-  p.ok(['next']);
-  for (const id of ['A-001', 'B-001', 'C-001']) {
+  // shared workspace: the three writers run one after another
+  const work = (id) => {
+    assert.match(p.ok(['next']), new RegExp(`=== ${id} `));
     p.write(`${id.toLowerCase()}.txt`, `${id}\n`);
     p.ok(['result', id, '--stdin'], { input: H.report(id, { files: [`${id.toLowerCase()}.txt`] }) });
-  }
+  };
 
   // A: verification not run yet
+  work('A-001');
   let out = p.refused(['review', 'A-001', '--stdin'], { input: H.review('A-001') });
   assert.match(out, /verification of A-001 has not passed yet/);
   assert.equal(p.status('A-001'), 'IMPLEMENTED');
   assert.deepEqual(p.task('A-001').evidence.reviews, []);
+  p.ok(['verify', 'A-001']);
 
   // B: verification failed
+  work('B-001');
   p.refused(['verify', 'B-001']);
   out = p.refused(['review', 'B-001', '--stdin'], { input: H.review('B-001') });
   assert.match(out, /B-001 needs a correction/);
   assert.equal(p.status('B-001'), 'CORRECTION_REQUIRED');
 
   // C: complexity 5 in balanced mode requires an independent review
+  work('C-001');
   p.ok(['verify', 'C-001']);
   out = p.refused(['review', 'C-001', '--stdin'], { input: H.review('C-001') });
   assert.match(out, /NO_INDEPENDENT_REVIEW/);
@@ -163,45 +169,97 @@ test('simulated-agent: review approve is refused while verification has not pass
   assert.match(text, /Changed files observed by the orchestrator:\n- c-001\.txt/);
   assert.match(text, /C-001-verify-1\.txt/);
   assert.match(text, /reviewer: opus-reviewer/);
+  const rid = p.task('C-001').review_dispatches[0].review_id;
+  assert.ok(text.includes(`review_id: '${rid}'`), 'the review template carries the review id');
+  assert.match(text, /Read the pinned evidence file .*C-001-review-1\.evidence\.txt.*You have no shell/);
+  const pinned = fs.readFileSync(path.join(p.runDir(), 'packages', 'C-001-review-1.evidence.txt'), 'utf8');
+  assert.match(pinned, /=== c-001\.txt \(sha256:[0-9a-f]{64}\)\nC-001\n/, 'the verified content is pinned for a reviewer without a shell');
   assert.equal(p.runRecord().usage.review_calls, 1);
 
   out = p.ok(['review', 'C-001', '--stdin'], { input: H.review('C-001', { reviewer: 'opus-reviewer' }) });
-  assert.match(out, /INDEPENDENT REVIEW RECORDED: C-001 approved by opus-reviewer; C-001 stays REVIEWING/);
+  assert.match(out, new RegExp(`INDEPENDENT REVIEW RECORDED: C-001 approved by opus-reviewer \\(review ${rid}, agent sim-reviewer-1\\); C-001 stays REVIEWING`));
   assert.equal(p.status('C-001'), 'REVIEWING');
   out = p.ok(['review', 'C-001', '--stdin'], { input: H.review('C-001') });
   assert.match(out, /APPROVED: C-001 -> APPROVED/);
 });
 
-test('simulated-agent: shared-workspace scope: a file outside the scope fails, files of another in-flight task and the state and inbox do not', () => {
+test('simulated-agent: regression: shared-workspace scope never attributes a change to another task by its scope; state and inbox are not evidence', () => {
   const p = H.project();
   p.ok(['init', 'Scope attribution']);
-  p.plan([H.spec('A-001'), H.spec('B-001')]);
-  p.ok(['next']);
-  p.ok(['started', 'A-001', 'B-001']);
-  // both simulated workers write in the same checkout; the orchestrator drafts in the inbox
-  p.write('a-001.txt', 'A\n');
-  p.write('b-001.txt', 'B partial\n');
+  p.plan([H.spec('A-001', { authorized_files: ['a/'], verification_commands: [H.existsCmd('a/x.txt')] }), H.spec('B-001', { authorized_files: ['b/'], verification_commands: [H.existsCmd('b/one.txt')] })]);
+  const out1 = p.ok(['next']);
+  assert.match(out1, /=== A-001 [\s\S]*B-001: shared_serial/);
+  p.ok(['started', 'A-001']);
+  // A (scoped to a/) changes b/private.txt as well; B (scoped to b/) is planned but not running.
+  p.write('a/x.txt', 'A\n');
+  p.write('b/private.txt', 'written by A\n');
   p.write('.opus-inbox/notes.md', 'orchestrator draft\n');
   p.write('.claude/opus-orchestrator/scratch.txt', 'state-directory file\n');
-  p.ok(['result', 'A-001', '--stdin'], { input: H.report('A-001', { files: ['a-001.txt'] }) });
-  let out = p.ok(['verify', 'A-001']);
-  assert.match(out, /VERIFICATION PASSED: A-001/);
-  assert.match(out, /Changed files: a-001\.txt\n/);
-  assert.match(out, /Ignored: b-001\.txt \(inside the scope of B-001, which owned work since this dispatch\)/);
+  p.ok(['result', 'A-001', '--stdin'], { input: H.report('A-001', { files: ['a/x.txt'] }) });
+  let out = p.refused(['verify', 'A-001']);
+  assert.match(out, /VERIFICATION FAILED: A-001 -> CORRECTION_REQUIRED/);
+  assert.match(out, /Scope violations \(changed outside the authorized files, not attributable to another task's recorded content\): b\/private\.txt/);
   assert.doesNotMatch(out, /notes\.md|scratch\.txt/);
+  assert.deepEqual(p.task('A-001').evidence.verification.scope.violations, ['b/private.txt']);
+  assert.equal(p.read('b/private.txt'), 'written by A\n', 'the unrelated edit is left in place, only the evidence is refused');
 
-  // simulated worker B strays outside its scope
-  p.write('b-001.txt', 'B final\n');
+  // The baseline of the first dispatch is kept: removing the stray file makes the next attempt
+  // pass, while leaving it would fail again (a retry cannot launder it into a new baseline).
+  const baseline = p.task('A-001').baseline;
+  p.ok(['correct', 'A-001', '--stdin'], { input: H.correction('A-001') });
+  assert.match(p.ok(['next']), /=== A-001 \(attempt 2/);
+  assert.deepEqual(p.task('A-001').baseline, baseline, 'the baseline survives the correction round');
+  p.ok(['result', 'A-001', '--stdin'], { input: H.report('A-001', { files: ['a/x.txt'] }) });
+  out = p.refused(['verify', 'A-001']);
+  assert.match(out, /Scope violations[^\n]*: b\/private\.txt/);
+  fs.rmSync(path.join(p.dir, 'b'), { recursive: true });
+  p.ok(['correct', 'A-001', '--stdin'], { input: H.correction('A-001', { strategy_change: 'leave b/ alone' }) });
+  p.ok(['next']);
+  p.ok(['result', 'A-001', '--stdin'], { input: H.report('A-001', { files: ['a/x.txt'] }) });
+  out = p.ok(['verify', 'A-001']);
+  assert.match(out, /VERIFICATION PASSED: A-001/);
+  assert.match(out, /Changed files: a\/x\.txt\n/);
+  const cand = p.task('A-001').evidence.verification.candidate;
+  assert.equal(cand.kind, 'shared');
+  assert.match(cand.files['a/x.txt'], /^sha256:[0-9a-f]{64}$/);
+  p.ok(['review', 'A-001', '--stdin', '--integrate'], { input: H.review('A-001') });
+  assert.equal(p.status('A-001'), 'COMPLETED');
+
+  // B strays outside its scope
+  p.ok(['next']);
+  p.write('b/one.txt', 'B\n');
   p.write('stray.txt', 'not authorized\n');
-  p.ok(['result', 'B-001', '--stdin'], { input: H.report('B-001', { files: ['b-001.txt', 'stray.txt'] }) });
+  p.ok(['result', 'B-001', '--stdin'], { input: H.report('B-001', { files: ['b/one.txt', 'stray.txt'] }) });
   out = p.refused(['verify', 'B-001']);
-  assert.match(out, /VERIFICATION FAILED: B-001 -> CORRECTION_REQUIRED/);
   assert.match(out, /files changed outside the authorized scope: stray\.txt/);
-  assert.match(out, /Scope violations \(changed outside the authorized files\): stray\.txt/);
-  assert.match(out, /Ignored: a-001\.txt \(inside the scope of A-001\)/);
-  const v = p.task('B-001').evidence.verification;
-  assert.deepEqual(v.scope.violations, ['stray.txt']);
-  assert.equal(v.passed, false);
+  assert.doesNotMatch(out, /a\/x\.txt/, 'A\'s integrated file predates B\'s baseline');
+});
+
+test('simulated-agent: shared workspace attributes a change to another task only by the content its verified candidate recorded', () => {
+  const p = H.project();
+  p.ok(['init', 'Content attribution']);
+  p.plan([H.spec('A-001', { authorized_files: ['a.txt'], verification_commands: [H.existsCmd('a.txt')] }), H.spec('B-001', { authorized_files: ['b.txt'], verification_commands: [H.existsCmd('b.txt')], priority: 'high' })]);
+  assert.match(p.ok(['next']), /=== B-001 /);
+  p.ok(['block', 'B-001', '--reason', 'waiting for a decision']); // B's baseline predates A's work
+  assert.match(p.ok(['next']), /=== A-001 /);
+  p.write('a.txt', 'A content\n');
+  p.ok(['result', 'A-001', '--stdin', '--verify'], { input: H.report('A-001', { files: ['a.txt'] }) });
+  p.ok(['review', 'A-001', '--stdin', '--integrate'], { input: H.review('A-001') });
+  p.ok(['unblock', 'B-001', '--reason', 'decided']);
+  assert.match(p.ok(['next']), /=== B-001 \(attempt 2/);
+  p.write('b.txt', 'B\n');
+  p.write('a.txt', 'tampered after A was verified\n');
+  p.ok(['result', 'B-001', '--stdin'], { input: H.report('B-001', { files: ['b.txt'] }) });
+  let out = p.refused(['verify', 'B-001']);
+  assert.match(out, /Scope violations[^\n]*: a\.txt/, 'content A never recorded is not A\'s');
+  p.write('a.txt', 'A content\n');
+  p.ok(['correct', 'B-001', '--stdin'], { input: H.correction('B-001') });
+  p.ok(['next']);
+  p.ok(['result', 'B-001', '--stdin'], { input: H.report('B-001', { files: ['b.txt'] }) });
+  out = p.ok(['verify', 'B-001']);
+  assert.match(out, /VERIFICATION PASSED: B-001/);
+  assert.match(out, /Attributed elsewhere: a\.txt \(content recorded by the verified candidate of A-001 at /);
+  assert.deepEqual(p.task('B-001').evidence.verification.changed_files, ['b.txt']);
 });
 
 test('simulated-agent: the correction loop is bounded and stale verification and reviews do not count', () => {

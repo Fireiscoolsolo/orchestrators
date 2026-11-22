@@ -76,8 +76,13 @@ test('simulated-agent: worktree strategy verifies in the task worktree, merges i
   out = finish(p, 'A-001', a, 'agent-a', ['src/a.txt']);
   assert.match(out, /Changed files: src\/a\.txt\n/);
   const va = p.task('A-001').evidence.verification;
-  assert.equal(path.resolve(va.workspace), path.resolve(a.wt), 'verification ran in the task worktree');
+  const checkout = path.resolve(p.dir, va.workspace);
+  assert.ok(checkout.startsWith(path.join(p.runDir(), 'worktrees', 'verify-A-001-')), 'verification ran in a clean checkout of the pinned candidate, owned by oo');
+  assert.equal(fs.existsSync(checkout), false, 'the clean checkout was removed afterwards');
+  assert.equal(va.candidate.commit, a.sha);
+  assert.equal(va.candidate.tree, H.g(a.wt, 'rev-parse', 'HEAD^{tree}'));
   assert.equal(p.task('A-001').result.commit, a.sha);
+  assert.equal(path.resolve(p.dir, p.task('A-001').binding.worktree), path.resolve(a.wt), 'the worker worktree is bound to the attempt');
   out = p.ok(['integrate', 'A-001']);
   assert.match(out, new RegExp(`INTEGRATED: A-001 -> COMPLETED \\(merge commit [0-9a-f]{40} on ${intBranch.replace(/\//g, '\\/')}\\)`));
   assert.notEqual(intHead(), base);
@@ -145,6 +150,6 @@ test('simulated-agent: worktree verification fails for uncommitted work and for 
   const out = p.refused(['verify', 'A-001']);
   assert.match(out, /VERIFICATION FAILED: A-001 -> CORRECTION_REQUIRED/);
   assert.match(out, /manual check failed: work committed \(uncommitted changes in the worktree: left-over\.txt\)/);
-  assert.match(out, /Scope violations \(changed outside the authorized files\): other\.txt/);
+  assert.match(out, /Scope violations \(changed outside the authorized files[^)]*\): other\.txt/);
   assert.match(p.refused(['result', 'A-001', '--stdin'], { input: H.report('A-001') }), /A-001 is CORRECTION_REQUIRED/);
 });
