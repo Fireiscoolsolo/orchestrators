@@ -166,8 +166,8 @@ function assertScenario(d) {
   const report = fs.readFileSync(d.reportPath, 'utf8');
   assert.match(report, /Overall status: COMPLETE\b/);
   assert.match(report, /### COMPLETED \(4\)/);
-  assert.match(report, /\| SLUG-001 \| verification \| 0 \| `node --test acceptance\/slugify\.acceptance\.test\.js` \| 1 \|/);
-  assert.match(report, /\| SLUG-001 \| verification \| 1 \| `node --test acceptance\/slugify\.acceptance\.test\.js` \| 0 \|/);
+  assert.match(report, /\| SLUG-001 \| verification \| 0 \| `node --test --test-reporter=spec acceptance\/slugify\.acceptance\.test\.js` \| 1 \|/);
+  assert.match(report, /\| SLUG-001 \| verification \| 1 \| `node --test --test-reporter=spec acceptance\/slugify\.acceptance\.test\.js` \| 0 \|/);
   assert.match(report, /SLUG-001: round 0 failed, current round 1 passed/);
   assert.equal(d.run.delivered, true);
 
@@ -269,7 +269,8 @@ test('the fixture project has the required files, small sources and no hidden ru
     const lines = fs.readFileSync(path.join(FIXTURE, f), 'utf8').split('\n').length;
     if (f.startsWith('src/')) assert.ok(lines < 40, `${f} has ${lines} lines`);
   }
-  assert.match(fs.readFileSync(path.join(FIXTURE, 'README.md'), 'utf8'), /## API\n\n_The API documentation has not been written yet\._/);
+  // Windows checkouts may convert the fixture to CRLF line endings.
+  assert.match(fs.readFileSync(path.join(FIXTURE, 'README.md'), 'utf8').replace(/\r\n/g, '\n'), /## API\n\n_The API documentation has not been written yet\._/);
   // package.json has no dependencies
   const pkg = JSON.parse(fs.readFileSync(path.join(FIXTURE, 'package.json'), 'utf8'));
   assert.equal(pkg.dependencies, undefined);

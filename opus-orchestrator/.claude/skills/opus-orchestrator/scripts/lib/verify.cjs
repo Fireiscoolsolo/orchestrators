@@ -34,7 +34,8 @@ const GIT_BASH_LOCATIONS = [
 // ---------------------------------------------------------------------------
 
 function shellKind(shell) {
-  const base = path.basename(String(shell)).toLowerCase().replace(/\.exe$/, '');
+  // Split on both separators: path.basename on POSIX keeps a whole Windows path such as C:\Windows\System32\cmd.exe.
+  const base = String(shell).split(/[\\/]/).pop().toLowerCase().replace(/\.exe$/, '');
   if (base === 'cmd') return 'cmd';
   if (base === 'powershell' || base === 'pwsh') return 'powershell';
   return 'posix';

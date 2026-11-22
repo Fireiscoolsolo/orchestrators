@@ -19,7 +19,7 @@
     - run test/slugify.test.js and read any failure
   verification_commands:
     - node --test test/slugify.test.js
-    - node --test acceptance/slugify.acceptance.test.js
+    - node --test --test-reporter=spec acceptance/slugify.acceptance.test.js
   context: src/slugify.js is a stub that throws. Do not edit the tests. The project has no dependencies and no install step.
   constraints: [no new dependencies, edit only src/slugify.js]
 
